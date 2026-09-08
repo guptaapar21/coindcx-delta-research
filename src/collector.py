@@ -109,25 +109,57 @@ def build_run(args: argparse.Namespace) -> int:
     try:
         md = fetch_market_details(timeout=args.rest_timeout)
         (run_dir / "market_details.json").write_text(json.dumps(md, ensure_ascii=False, indent=2), encoding="utf-8")
-        requested = set(args.pair)
-        available = {x.get("symbol") or x.get("pair") for x in md if isinstance(x, dict)} if isinstance(md, list) else set()
-        missing = sorted(p for p in requested if p not in available and p.replace("B-", "") not in available)
+        # Resolve the exact websocket channel pair from Market Details. CoinDCX
+        # explicitly requires the `pair` field from Market Details for socket channels.
+        # Keep the configured value for output naming, but subscribe using the canonical
+        # market-details pair whenever we can resolve it.
+        def norm_market_key(value: Any) -> str:
+            if value is None:
+                return ""
+            return str(value).upper().replace("-", "").replace("_", "").replace("/", "")
+
+        rows = [x for x in md if isinstance(x, dict)] if isinstance(md, list) else []
+        pair_by_exact: dict[str, str] = {}
+        pair_by_norm: dict[str, str] = {}
+        for row in rows:
+            mpair = row.get("pair")
+            symbol = row.get("symbol")
+            if mpair:
+                pair_by_exact[str(mpair).upper()] = str(mpair)
+                pair_by_norm[norm_market_key(mpair)] = str(mpair)
+            if symbol and mpair:
+                pair_by_norm[norm_market_key(symbol)] = str(mpair)
+
+        resolved_pairs: dict[str, str] = {}
+        missing: list[str] = []
+        for configured in args.pair:
+            canonical = pair_by_exact.get(str(configured).upper())
+            if canonical is None:
+                canonical = pair_by_norm.get(norm_market_key(configured))
+            if canonical is None:
+                missing.append(configured)
+            else:
+                resolved_pairs[configured] = canonical
+
         if missing:
             write_jsonl(run_dir / "data_quality.jsonl", {"event": "pair_validation_warning", "recv_ts_ms": now_ms(), "missing_pairs": missing})
             logging.warning("Some requested pairs were not matched in market metadata: %s", missing)
+        else:
+            logging.info("Resolved websocket pairs: %s", resolved_pairs)
     except Exception as exc:
         logging.exception("Market details bootstrap failed: %s", exc)
         write_jsonl(run_dir / "data_quality.jsonl", {"event": "bootstrap_error", "kind": "market_details", "recv_ts_ms": now_ms(), "error": repr(exc)})
 
     for pair in args.pair:
-        payload: dict[str, Any] = {"pair": pair, "captured_ms": now_ms(), "orderbook_50": None, "candles": {}}
+        request_pair = resolved_pairs.get(pair, pair)
+        payload: dict[str, Any] = {"pair": pair, "resolved_pair": request_pair, "captured_ms": now_ms(), "orderbook_50": None, "candles": {}}
         try:
-            payload["orderbook_50"] = fetch_orderbook(pair, depth=50, timeout=args.rest_timeout)
+            payload["orderbook_50"] = fetch_orderbook(request_pair, depth=50, timeout=args.rest_timeout)
         except Exception as exc:
             payload["orderbook_error"] = repr(exc)
         for interval in args.candle_interval:
             try:
-                payload["candles"][interval] = fetch_candles(pair, interval, limit=args.bootstrap_candles, timeout=args.rest_timeout)
+                payload["candles"][interval] = fetch_candles(request_pair, interval, limit=args.bootstrap_candles, timeout=args.rest_timeout)
             except Exception as exc:
                 payload["candles"][interval] = {"error": repr(exc)}
         write_bootstrap(run_dir / f"{safe_name(pair)}_bootstrap.json", payload)
@@ -149,15 +181,23 @@ def build_run(args: argparse.Namespace) -> int:
     def connect() -> None:
         quality("connected")
         logging.info("Connected")
-        for pair in args.pair:
+        for configured_pair in args.pair:
+            pair = resolved_pairs.get(configured_pair, configured_pair)
             channels = [f"{pair}@trades", f"{pair}@orderbook@50"]
             if args.capture_price_channel:
                 channels.append(f"{pair}@prices")
             for interval in args.candle_interval:
                 channels.append(f"{pair}_{interval}")
             for channel in channels:
-                sio.emit("join", {"channelName": channel})
-                quality("joined_channel", channel=channel)
+                try:
+                    def _join_ack(*ack: Any, _channel: str = channel) -> None:
+                        quality("join_ack", channel=_channel, ack=ack)
+                        logging.info("Join ack %s: %s", _channel, ack)
+                    sio.emit("join", {"channelName": channel}, callback=_join_ack)
+                    quality("join_emitted", channel=channel)
+                except Exception as exc:
+                    quality("join_error", channel=channel, error=repr(exc))
+                    logging.exception("Join failed for %s: %s", channel, exc)
 
     @sio.event
     def disconnect() -> None:
@@ -309,6 +349,14 @@ def build_run(args: argparse.Namespace) -> int:
             write_jsonl(run_dir / f"{safe_name(str(pair))}_candles_{interval}.jsonl", rec)
             counts["candles"] += 1
 
+    @sio.on("*")
+    def on_any_event(event: str, response: Any) -> None:
+        # Diagnostic visibility for unexpected server events. Known data events are
+        # already handled above; this is intentionally lightweight.
+        if event not in {"new-trade", "depth-snapshot", "price-change", "candlestick", "connect", "disconnect"}:
+            quality("socket_event", socket_event=event, raw=response)
+            logging.info("Socket event %s: %s", event, response)
+
     start_monotonic = time.monotonic()
     quality("collector_started", run_id=run_id, pid=__import__("os").getpid())
     try:
@@ -329,7 +377,8 @@ def build_run(args: argparse.Namespace) -> int:
             quality("heartbeat", connected=sio.connected, event_counts=dict(counts))
     finally:
         if sio.connected:
-            for pair in args.pair:
+            for configured_pair in args.pair:
+                pair = resolved_pairs.get(configured_pair, configured_pair)
                 channels = [f"{pair}@trades", f"{pair}@orderbook@50"]
                 if args.capture_price_channel:
                     channels.append(f"{pair}@prices")
