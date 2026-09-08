@@ -6,6 +6,7 @@ import json
 import logging
 import platform
 import signal
+from importlib.metadata import PackageNotFoundError, version as package_version
 import sys
 import time
 import uuid
@@ -38,6 +39,18 @@ def unwrap(response: Any) -> Any:
 
 def safe_name(value: str) -> str:
     return value.replace("/", "_").replace("-", "_")
+
+def get_socketio_version() -> str:
+    """Return the installed python-socketio package version.
+
+    python-socketio does not reliably expose ``__version__`` across releases,
+    so read the distribution metadata instead.
+    """
+    try:
+        return package_version("python-socketio")
+    except PackageNotFoundError:
+        return "unknown"
+
 
 
 def write_jsonl(path: Path, obj: dict[str, Any]) -> None:
@@ -86,7 +99,7 @@ def build_run(args: argparse.Namespace) -> int:
         "host": platform.node(),
         "python": sys.version,
         "platform": platform.platform(),
-        "socket_library": f"python-socketio {socketio.__version__}",
+        "socket_library": f"python-socketio {get_socketio_version()}",
         "config_source": args.config or None,
         "notes": "Research-only public market-data collector. No trading actions.",
     }
