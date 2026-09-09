@@ -23,6 +23,7 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 235
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -75,7 +76,12 @@ jobs:
         run: |
           git config user.name "advisorx-bot"
           git config user.email "advisorx-bot@users.noreply.github.com"
-          git add data/research/compact_1m/ data/research/compact_3m/ data/state/protected_batches.json || true
+
+          git add \
+            data/research/compact_1m/ \
+            data/research/compact_3m/ \
+            data/state/protected_batches.json || true
+
           if ! git diff --cached --quiet; then
             git commit -m "chore(data): update CoinDCX compact research state" || true
             git push || true
@@ -108,7 +114,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Trigger next batch
-        if: always()
+        if: success()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
