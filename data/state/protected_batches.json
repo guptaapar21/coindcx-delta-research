@@ -1,1 +1,4 @@
-
+{
+  "batch_ids": [],
+  "notes": "Add batch IDs here to prevent automatic raw-artifact archival/deletion."
+}
