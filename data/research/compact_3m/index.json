@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "months": [
+    "2026-09"
+  ],
+  "epoch_key": "three_minute_epoch",
+  "generated_utc": "2026-09-09T15:43:55.911303+00:00",
+  "note": "Compact history is retained as long-lived research data; raw websocket data lives in Actions artifacts/release archives."
+}
