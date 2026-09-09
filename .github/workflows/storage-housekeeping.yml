@@ -1,0 +1,32 @@
+name: AdvisorX CoinDCX storage housekeeping
+
+on:
+  schedule:
+    - cron: "11 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  housekeeping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install requests
+      - name: Monitor artifact storage and promote old raw batches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python src/storage_manager.py
+      - name: Upload housekeeping report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coindcx-storage-housekeeping-${{ github.run_id }}
+          path: storage_report.json
+          retention-days: 7
+          if-no-files-found: ignore
