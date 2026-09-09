@@ -54,3 +54,27 @@ def test_3m_complete_bucket_only():
 def test_3m_dedup_not_required_and_missing_minute_skips_bucket():
     rows = [minute_row('B-ETH_USDT', 0, 100), minute_row('B-ETH_USDT', 120, 102)]
     assert research_batch.aggregate_3m(rows) == []
+
+
+def test_string_encoded_raw_data_is_parsed(tmp_path):
+    batch = tmp_path / 'b'; batch.mkdir()
+    rec = {"raw": {"data": json.dumps({"s": "B-ETH_USDT", "T": 1000, "p": "2500", "q": "1.5", "m": 0})}}
+    write_trade_file(batch, [rec])
+    out = research_batch.build_seconds(batch)
+    assert out[0]['symbol'] == 'B-ETH_USDT'
+    assert out[0]['aggressive_buy_qty'] == 1.5
+
+
+
+def test_actual_collector_string_payload_and_symbol_normalization(tmp_path):
+    batch = tmp_path / 'b'; batch.mkdir()
+    rec = {
+        "received_at_ms": 2000,
+        "raw": {"event": "new-trade", "data": json.dumps({
+            "s": "BTCUSDT", "T": 1000, "p": "80000", "q": "0.01", "m": 1
+        })}
+    }
+    write_trade_file(batch, [rec])
+    out = research_batch.build_seconds(batch)
+    assert out[0]['symbol'] == 'B-BTC_USDT'
+    assert out[0]['aggressive_sell_qty'] == 0.01
