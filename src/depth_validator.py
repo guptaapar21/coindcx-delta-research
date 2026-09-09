@@ -28,13 +28,32 @@ def records(path: Path):
 def extract(rec: dict[str, Any]) -> dict[str, Any]:
     raw = rec.get("raw", {})
     data = raw.get("data") if isinstance(raw, dict) else None
-    return data if isinstance(data, dict) else (raw if isinstance(raw, dict) else {})
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        try:
+            decoded = json.loads(data)
+            if isinstance(decoded, dict):
+                return decoded
+        except (TypeError, ValueError):
+            pass
+    return raw if isinstance(raw, dict) else {}
 
 
 def normalize_levels(x: Any) -> dict[str, str]:
     if not isinstance(x, dict):
         return {}
     return {str(k): str(v) for k, v in x.items()}
+
+
+def canonical_symbol(value: Any) -> str:
+    s = str(value or "UNKNOWN").upper()
+    return {
+        "BTCUSDT": "B-BTC_USDT",
+        "B-BTC_USDT": "B-BTC_USDT",
+        "ETHUSDT": "B-ETH_USDT",
+        "B-ETH_USDT": "B-ETH_USDT",
+    }.get(s, s)
 
 
 def analyze(batch: Path) -> dict[str, Any]:
@@ -50,55 +69,66 @@ def analyze(batch: Path) -> dict[str, Any]:
     previous_update_levels: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
     previous_snapshot_levels: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
 
+    merged: list[tuple[int, str, dict[str, Any], dict[str, Any]]] = []
     for filename, typ in (("depth_snapshot.jsonl.gz", "snapshot"), ("depth_update.jsonl.gz", "update")):
         path = batch / filename
         for rec in records(path):
             d = extract(rec)
-            symbol = str(d.get("s") or rec.get("pair") or "UNKNOWN")
-            s = stats[symbol]
-            s["symbols_seen"].add(symbol)
-            levels = []
-            asks = normalize_levels(d.get("asks"))
-            bids = normalize_levels(d.get("bids"))
-            for price, qty in asks.items():
-                levels.append(("a", price, qty))
-            for price, qty in bids.items():
-                levels.append(("b", price, qty))
-            s[f"{typ}s"] += 1
-            s[f"levels_per_{typ}"].append(len(levels))
-            current_set = set(levels)
-            prev = previous_update_levels[symbol] if typ == "update" else previous_snapshot_levels[symbol]
-            if prev:
-                s[f"{typ}_price_repeats"] += len({(side, price) for side, price, _ in current_set} & {(side, price) for side, price, _ in prev})
-            if typ == "update":
-                previous_update_levels[symbol] = current_set
-            else:
-                previous_snapshot_levels[symbol] = current_set
-
-            vs = d.get("vs")
-            if vs is not None:
-                try:
-                    v = int(vs)
-                    last = previous_versions.get(symbol)
-                    if last is not None:
-                        if v == last:
-                            s["version_duplicates"] += 1
-                        elif v < last:
-                            s["version_backtracks"] += 1
-                        elif v > last + 1:
-                            s["version_gaps"] += 1
-                            if len(s["version_gap_examples"]) < 20:
-                                s["version_gap_examples"].append({"previous": last, "current": v, "gap": v - last - 1})
-                    previous_versions[symbol] = v
-                    s["versions"].append(v)
-                except (TypeError, ValueError):
-                    pass
-            ts = d.get("ts", d.get("T"))
+            raw_ts = d.get("ts", d.get("T", rec.get("exchange_timestamp_ms")))
             try:
-                if ts is not None:
-                    s["timestamp_ms"].append(int(ts))
+                ts_i = int(raw_ts) if raw_ts is not None else int(rec.get("received_at_ms", 0))
+            except (TypeError, ValueError):
+                ts_i = int(rec.get("received_at_ms", 0))
+            merged.append((ts_i, typ, d, rec))
+
+    merged.sort(key=lambda x: (x[0], 0 if x[1] == "snapshot" else 1))
+
+    for _, typ, d, rec in merged:
+        symbol = canonical_symbol(d.get("s") or rec.get("pair"))
+        s = stats[symbol]
+        s["symbols_seen"].add(symbol)
+        levels = []
+        asks = normalize_levels(d.get("asks"))
+        bids = normalize_levels(d.get("bids"))
+        for price, qty in asks.items():
+            levels.append(("a", price, qty))
+        for price, qty in bids.items():
+            levels.append(("b", price, qty))
+        s[f"{typ}s"] += 1
+        s[f"levels_per_{typ}"].append(len(levels))
+        current_set = set(levels)
+        prev = previous_update_levels[symbol] if typ == "update" else previous_snapshot_levels[symbol]
+        if prev:
+            s[f"{typ}_price_repeats"] += len({(side, price) for side, price, _ in current_set} & {(side, price) for side, price, _ in prev})
+        if typ == "update":
+            previous_update_levels[symbol] = current_set
+        else:
+            previous_snapshot_levels[symbol] = current_set
+
+        vs = d.get("vs")
+        if vs is not None:
+            try:
+                v = int(vs)
+                last = previous_versions.get(symbol)
+                if last is not None:
+                    if v == last:
+                        s["version_duplicates"] += 1
+                    elif v < last:
+                        s["version_backtracks"] += 1
+                    elif v > last + 1:
+                        s["version_gaps"] += 1
+                        if len(s["version_gap_examples"]) < 20:
+                            s["version_gap_examples"].append({"previous": last, "current": v, "gap": v - last - 1})
+                previous_versions[symbol] = v
+                s["versions"].append(v)
             except (TypeError, ValueError):
                 pass
+        ts = d.get("ts", d.get("T", rec.get("exchange_timestamp_ms")))
+        try:
+            if ts is not None:
+                s["timestamp_ms"].append(int(ts))
+        except (TypeError, ValueError):
+            pass
 
     output = {"schema_version": 1, "classification": {}, "symbols": {}}
     for symbol, s in stats.items():

@@ -32,6 +32,21 @@ def read_gz_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                 yield json.loads(line)
 
 
+def extract_payload_data(rec: dict[str, Any]) -> dict[str, Any]:
+    raw = rec.get("raw", {})
+    data = raw.get("data") if isinstance(raw, dict) else None
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        try:
+            decoded = json.loads(data)
+            if isinstance(decoded, dict):
+                return decoded
+        except (TypeError, ValueError):
+            pass
+    return raw if isinstance(raw, dict) else {}
+
+
 def sec_bucket(ms: int) -> int:
     return ms // 1000
 
@@ -45,6 +60,19 @@ def safe_float(x: Any) -> float | None:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def canonical_symbol(value: Any) -> str | None:
+    if value is None:
+        return None
+    s = str(value).upper()
+    mapping = {
+        "B-BTC_USDT": "B-BTC_USDT",
+        "BTCUSDT": "B-BTC_USDT",
+        "B-ETH_USDT": "B-ETH_USDT",
+        "ETHUSDT": "B-ETH_USDT",
+    }
+    return mapping.get(s, s if s else None)
 
 
 def build_seconds(batch: Path) -> list[dict[str, Any]]:
@@ -83,8 +111,10 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
 
     if trade_path.exists():
         for rec in read_gz_jsonl(trade_path):
-            data = rec.get("raw", {}).get("data", rec.get("raw", {}))
-            symbol = str(data.get("s") or rec.get("pair") or "UNKNOWN")
+            data = extract_payload_data(rec)
+            symbol = canonical_symbol(data.get("s") or rec.get("pair"))
+            if symbol is None:
+                continue
             t = data.get("T", rec.get("exchange_timestamp_ms"))
             p = safe_float(data.get("p"))
             q = safe_float(data.get("q"))
@@ -108,25 +138,31 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
 
     if price_path.exists():
         for rec in read_gz_jsonl(price_path):
-            data = rec.get("raw", {}).get("data", rec.get("raw", {}))
+            data = extract_payload_data(rec)
             t = data.get("T", rec.get("exchange_timestamp_ms"))
             p = safe_float(data.get("p"))
             if t is None or p is None:
                 continue
-            symbol = str(data.get("s") or rec.get("pair") or "UNKNOWN")
-            r = row(symbol, sec_bucket(int(t)))
-            r["price_events"] += 1
-            r["last_price"] = p
+            symbol = data.get("s") or rec.get("pair")
+            if symbol is not None:
+                symbol = canonical_symbol(symbol)
+                if symbol is None:
+                    continue
+                r = row(symbol, sec_bucket(int(t)))
+                r["price_events"] += 1
+                r["last_price"] = p
 
     for path, key in ((depth_u, "depth_update_events"), (depth_s, "depth_snapshot_events")):
         if not path.exists():
             continue
         for rec in read_gz_jsonl(path):
-            data = rec.get("raw", {}).get("data", rec.get("raw", {}))
+            data = extract_payload_data(rec)
             t = data.get("ts", rec.get("exchange_timestamp_ms"))
             if t is None:
                 continue
-            symbol = str(data.get("s") or rec.get("pair") or "UNKNOWN")
+            symbol = canonical_symbol(data.get("s") or rec.get("pair"))
+            if symbol is None:
+                continue
             r = row(symbol, sec_bucket(int(t)))
             r[key] += 1
             if data.get("vs") is not None:

@@ -143,7 +143,16 @@ class Collector:
     @staticmethod
     def _extract_data(payload: dict[str, Any]) -> dict[str, Any]:
         data = payload.get("data")
-        return data if isinstance(data, dict) else payload
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, str):
+            try:
+                decoded = json.loads(data)
+                if isinstance(decoded, dict):
+                    return decoded
+            except (TypeError, ValueError):
+                pass
+        return payload
 
     def _write_event(self, event_name: str, response: Any) -> None:
         received_ms = utc_now_ms()
