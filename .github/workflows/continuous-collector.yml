@@ -4,12 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: Batch duration in minutes (5-230). Production default is 230.
+        description: "Batch duration in minutes (5-230)"
         required: false
-        default: "230"
+        default: "30"
         type: string
+
+      continue_chain:
+        description: "Start/continue automatic batch chaining"
+        required: false
+        default: false
+        type: boolean
+
   repository_dispatch:
-    types: [coindcx-next-batch]
+    types:
+      - coindcx-next-batch
 
 permissions:
   contents: write
@@ -45,22 +53,34 @@ jobs:
           BATCH_ID="$(date -u +%Y%m%dT%H%M%SZ)_run_${GITHUB_RUN_ID}"
           echo "batch_id=${BATCH_ID}" >> "$GITHUB_OUTPUT"
 
+      - name: Determine batch duration
+        id: duration
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "minutes=230" >> "$GITHUB_OUTPUT"
+          else
+            echo "minutes=${{ inputs.duration_minutes || '30' }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Collect raw CoinDCX streams
-        env:
-          DURATION_MINUTES: ${{ inputs.duration_minutes || '230' }}
         run: |
           mkdir -p "runtime/${{ steps.batch.outputs.batch_id }}"
+
           python src/collector.py \
-            --duration-minutes "$DURATION_MINUTES" \
+            --duration-minutes "${{ steps.duration.outputs.minutes }}" \
             --out "runtime/${{ steps.batch.outputs.batch_id }}"
 
       - name: Build research features
         if: always()
         run: |
-          python src/research_batch.py --batch "runtime/${{ steps.batch.outputs.batch_id }}"
-          python src/depth_validator.py --batch "runtime/${{ steps.batch.outputs.batch_id }}"
+          python src/research_batch.py \
+            --batch "runtime/${{ steps.batch.outputs.batch_id }}"
 
-      - name: Merge compact 1m history
+          python src/depth_validator.py \
+            --batch "runtime/${{ steps.batch.outputs.batch_id }}"
+
+      - name: Merge compact research history
         if: always()
         run: |
           if test -f "runtime/${{ steps.batch.outputs.batch_id }}/features_1m.csv.gz"; then
@@ -97,14 +117,14 @@ jobs:
           compression-level: 0
           if-no-files-found: warn
 
-      - name: Archive/rotate old raw artifacts
+      - name: Run storage manager
         if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python src/storage_manager.py
 
-      - name: Publish storage report as small artifact
+      - name: Upload storage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -113,15 +133,13 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-      - name: Trigger next batch
-        if: success()
+      - name: Trigger next production batch
+        if: ${{ success() && (github.event_name == 'repository_dispatch' || inputs.continue_chain == true) }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         shell: bash
         run: |
-          # repository_dispatch explicitly creates a workflow run when authenticated
-          # with GITHUB_TOKEN; this is the self-chain that keeps collection alive.
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
