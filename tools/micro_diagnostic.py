@@ -14,7 +14,12 @@ import socketio
 
 PAIRS = ["B-BTC_USDT", "B-ETH_USDT"]
 URL = "https://stream-spot.coindcx.com"
-EVENTS = ("new-trade", "price-change", "candlestick", "depth-update", "depth-snapshot")
+# Production-required live transport categories. CoinDCX's live candlestick
+# channel is diagnostic-only because the production research pipeline builds
+# its own 1m/3m bars from raw trades.
+REQUIRED_EVENTS = ("new-trade", "price-change", "depth-update", "depth-snapshot")
+OPTIONAL_EVENTS = ("candlestick",)
+EVENTS = REQUIRED_EVENTS + OPTIONAL_EVENTS
 
 
 def main():
@@ -59,8 +64,9 @@ def main():
         "counts": dict(counts),
         "unknown_events": dict(unknown),
         "socketio_version": importlib.metadata.version("python-socketio"),
-        "required": list(EVENTS),
-        "status": "PASS" if all(counts[e] > 0 for e in EVENTS) else "FAIL"
+        "required": list(REQUIRED_EVENTS),
+        "optional": list(OPTIONAL_EVENTS),
+        "status": "PASS" if all(counts[e] > 0 for e in REQUIRED_EVENTS) else "FAIL"
     }
     (out / "manifest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
