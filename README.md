@@ -45,7 +45,7 @@ The initial 48-hour archive-age / 70% trigger settings are deliberately configur
 
 1. Copy this package into the root of `guptaapar21/coindcx-delta-research`.
 2. Commit `.github/workflows`, `src`, `tools`, `config.json`, `requirements.txt`, `data/state/protected_batches.json`, and the README.
-3. In **Actions**, run `AdvisorX CoinDCX micro transport diagnostic` once. It must pass.
+3. In **Actions**, run `AdvisorX CoinDCX micro transport diagnostic` once. It must pass. The diagnostic requires trades, prices, `depth-update`, and `depth-snapshot`; CoinDCX live candlesticks are optional because the production pipeline builds its own 1m/3m bars from trades.
 4. Run `AdvisorX historical baseline backfill` for 3 days once.
 5. Start `AdvisorX CoinDCX continuous collector` manually with the default 230-minute duration.
 6. After the first real batch, inspect the uploaded raw artifact, `depth_validation.json`, `data_quality.json`, `research_summary.json`, and `storage_report.json`.
