@@ -10,6 +10,22 @@
       {
         "name": "ETH/USDT",
         "pair": "B-ETH_USDT"
+      },
+      {
+        "name": "SOL/USDT",
+        "pair": "B-SOL_USDT"
+      },
+      {
+        "name": "SUI/USDT",
+        "pair": "B-SUI_USDT"
+      },
+      {
+        "name": "XRP/USDT",
+        "pair": "B-XRP_USDT"
+      },
+      {
+        "name": "DOGE/USDT",
+        "pair": "B-DOGE_USDT"
       }
     ],
     "orderbook_depth": 50,
@@ -22,10 +38,27 @@
       {
         "name": "ETH/USDT",
         "pair": "B-ETH_USDT"
+      },
+      {
+        "name": "SOL/USDT",
+        "pair": "B-SOL_USDT"
+      },
+      {
+        "name": "SUI/USDT",
+        "pair": "B-SUI_USDT"
+      },
+      {
+        "name": "XRP/USDT",
+        "pair": "B-XRP_USDT"
+      },
+      {
+        "name": "DOGE/USDT",
+        "pair": "B-DOGE_USDT"
       }
     ],
     "futures_current_prices": true,
-    "futures_enabled": true
+    "futures_enabled": true,
+    "futures_orderbook_depth": 50
   },
   "collector": {
     "default_duration_minutes": 230,
