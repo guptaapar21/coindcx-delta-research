@@ -78,3 +78,21 @@ def test_actual_collector_string_payload_and_symbol_normalization(tmp_path):
     out = research_batch.build_seconds(batch)
     assert out[0]['symbol'] == 'B-BTC_USDT'
     assert out[0]['aggressive_sell_qty'] == 0.01
+
+
+def test_long_forward_labels_are_added_without_expanding_flow_windows(tmp_path):
+    batch = tmp_path / 'b'; batch.mkdir()
+    rows = []
+    for sec, price in [(0, 100), (1, 101), (5, 105), (15, 115), (30, 130),
+                       (60, 160), (180, 280), (300, 400), (600, 700),
+                       (900, 1000), (1800, 1900)]:
+        rows.append({"raw": {"data": {
+            "s": "B-BTC_USDT", "T": sec * 1000, "p": str(price), "q": "1", "m": 0
+        }}})
+    write_trade_file(batch, rows)
+    out = research_batch.build_seconds(batch)
+    r0 = next(r for r in out if r['epoch_second'] == 0)
+    assert list(research_batch.WINDOWS) == [5, 15, 30, 60, 180]
+    assert abs(r0['forward_return_5s'] - 0.05) < 1e-12
+    assert abs(r0['forward_return_300s'] - 3.0) < 1e-12
+    assert abs(r0['forward_return_1800s'] - 18.0) < 1e-12
