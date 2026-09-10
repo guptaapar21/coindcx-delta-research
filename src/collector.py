@@ -111,12 +111,14 @@ class Collector:
         self.out_dir = out_dir
         self.duration_seconds = max(5.0, duration_minutes * 60)
         self.stop_event = threading.Event()
-        self.sio = socketio.Client(
-            reconnection=bool(cfg["collector"].get("reconnect", True)),
-            reconnection_attempts=int(cfg["collector"].get("max_reconnect_attempts", 12)),
-            logger=False,
-            engineio_logger=False,
-        )
+        socket_kwargs = {
+            "reconnection": bool(cfg["collector"].get("reconnect", True)),
+            "reconnection_attempts": int(cfg["collector"].get("max_reconnect_attempts", 12)),
+            "logger": False,
+            "engineio_logger": False,
+        }
+        self.sio = socketio.Client(**socket_kwargs)
+        self.futures_sio = socketio.Client(**socket_kwargs)
         self.session = requests.Session()
         self.event_counts = Counter()
         self.futures_event_counts = Counter()
@@ -128,7 +130,9 @@ class Collector:
         self.futures_join_channels: list[str] = []
         self.futures_pairs: set[str] = set()
         self.join_emissions = 0
+        self.futures_join_emissions = 0
         self.reconnect_count = 0
+        self.futures_reconnect_count = 0
         self.start_epoch = time.time()
         self.last_event_monotonic = time.monotonic()
         self.last_event_exchange_ms: dict[str, int] = {}
@@ -229,32 +233,28 @@ class Collector:
     def _register_handlers(self) -> None:
         @self.sio.event
         def connect():
-            self.connection_events.append({"time_utc": utc_iso(), "state": "connected"})
+            self.connection_events.append({"time_utc": utc_iso(), "market": "spot", "state": "connected"})
             print(f"Connected to {self.cfg['coindcx']['socket_url']}", flush=True)
             for channel in self.join_channels:
                 try:
                     self.sio.emit("join", {"channelName": channel})
                     self.join_emissions += 1
                 except Exception as exc:
-                    self._record_error(f"join:{channel}", exc)
+                    self._record_error(f"spot:join:{channel}", exc)
 
         @self.sio.event
         def disconnect():
             self.reconnect_count += 1
-            self.connection_events.append({"time_utc": utc_iso(), "state": "disconnected", "reconnect_count": self.reconnect_count})
-            print("Socket disconnected", flush=True)
+            self.connection_events.append({"time_utc": utc_iso(), "market": "spot", "state": "disconnected", "reconnect_count": self.reconnect_count})
+            print("Spot socket disconnected", flush=True)
 
         @self.sio.on("new-trade")
         def on_trade(response):
-            payload = self._payload("new-trade", response)
-            data = self._extract_data(payload)
-            self._write_event("new-trade", response, futures=self._is_futures_data(data))
+            self._write_event("new-trade", response, futures=False)
 
         @self.sio.on("price-change")
         def on_price(response):
-            payload = self._payload("price-change", response)
-            data = self._extract_data(payload)
-            self._write_event("price-change", response, futures=self._is_futures_data(data))
+            self._write_event("price-change", response, futures=False)
 
         @self.sio.on("depth-update")
         def on_depth_update(response):
@@ -264,18 +264,55 @@ class Collector:
         def on_depth_snapshot(response):
             self._write_event("depth-snapshot", response)
 
-        @self.sio.on("currentPrices@futures#update")
+        @self.sio.on("*")
+        def on_spot_catch_all(event, *args):
+            if event not in self.EVENT_FILES and event not in {"connect", "disconnect", "connect_error"}:
+                self.unknown_events[f"spot:{event}"] += 1
+
+        @self.futures_sio.on("connect")
+        def futures_connect():
+            futures_url = self.cfg["coindcx"].get("futures_socket_url")
+            self.connection_events.append({"time_utc": utc_iso(), "market": "futures", "state": "connected"})
+            print(f"Connected to {futures_url}", flush=True)
+            for channel in self.futures_join_channels:
+                try:
+                    self.futures_sio.emit("join", {"channelName": channel})
+                    self.futures_join_emissions += 1
+                except Exception as exc:
+                    self._record_error(f"futures:join:{channel}", exc)
+
+        @self.futures_sio.on("disconnect")
+        def futures_disconnect():
+            self.futures_reconnect_count += 1
+            self.connection_events.append({"time_utc": utc_iso(), "market": "futures", "state": "disconnected", "reconnect_count": self.futures_reconnect_count})
+            print("Futures socket disconnected", flush=True)
+
+        @self.futures_sio.on("new-trade")
+        def on_futures_trade(response):
+            payload = self._payload("new-trade", response)
+            data = self._extract_data(payload)
+            if self._is_futures_data(data):
+                self._write_event("new-trade", response, futures=True)
+
+        @self.futures_sio.on("price-change")
+        def on_futures_price(response):
+            payload = self._payload("price-change", response)
+            data = self._extract_data(payload)
+            if self._is_futures_data(data):
+                self._write_event("price-change", response, futures=True)
+
+        @self.futures_sio.on("currentPrices@futures#update")
         def on_futures_current_prices(response):
             self._write_futures_current_prices(response, self.futures_pairs, "currentPrices@futures#update")
 
-        @self.sio.on("currentPrices@futures#snapshot")
+        @self.futures_sio.on("currentPrices@futures#snapshot")
         def on_futures_current_prices_snapshot(response):
             self._write_futures_current_prices(response, self.futures_pairs, "currentPrices@futures#snapshot")
 
-        @self.sio.on("*")
-        def on_catch_all(event, *args):
-            if event not in self.EVENT_FILES and event not in {"connect", "disconnect", "connect_error"}:
-                self.unknown_events[str(event)] += 1
+        @self.futures_sio.on("*")
+        def on_futures_catch_all(event, *args):
+            if event not in {"new-trade", "price-change", "currentPrices@futures#update", "currentPrices@futures#snapshot", "connect", "disconnect", "connect_error"}:
+                self.unknown_events[f"futures:{event}"] += 1
 
     def stop(self, *_args: Any) -> None:
         self.stop_event.set()
@@ -302,27 +339,49 @@ class Collector:
                     f"{pair}@trades-futures",
                     f"{pair}@prices-futures",
                 ])
-        self.join_channels = sorted(channels) + self.futures_join_channels
-        self.connection_events.append({"time_utc": utc_iso(), "state": "starting", "channels": self.join_channels})
+        self.join_channels = sorted(channels)
+        self.connection_events.append({"time_utc": utc_iso(), "market": "spot", "state": "starting", "channels": sorted(channels)})
+        if futures_enabled:
+            self.connection_events.append({"time_utc": utc_iso(), "market": "futures", "state": "starting", "channels": self.futures_join_channels})
 
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
 
+        spot_connected = False
         try:
             self.sio.connect(
                 self.cfg["coindcx"]["socket_url"],
                 transports=["websocket"],
                 wait_timeout=int(self.cfg["collector"].get("connect_timeout_seconds", 30)),
             )
+            spot_connected = True
         except Exception as exc:
-            self._record_error("socket_connect", exc)
+            self._record_error("spot:socket_connect", exc)
             return 2
+
+        futures_connected = False
+        if futures_enabled:
+            futures_url = self.cfg["coindcx"].get("futures_socket_url")
+            if not futures_url:
+                self._record_error("futures:socket_config", "futures_socket_url is required when futures_enabled=true")
+            else:
+                try:
+                    self.futures_sio.connect(
+                        futures_url,
+                        transports=["websocket"],
+                        wait_timeout=int(self.cfg["collector"].get("connect_timeout_seconds", 30)),
+                    )
+                    futures_connected = True
+                except Exception as exc:
+                    self._record_error("futures:socket_connect", exc)
 
         deadline = time.monotonic() + self.duration_seconds
         heartbeat_every = int(self.cfg["collector"].get("heartbeat_seconds", 60))
         next_heartbeat = time.monotonic() + heartbeat_every
         while not self.stop_event.is_set() and time.monotonic() < deadline:
             self.sio.sleep(0.25)
+            if futures_connected:
+                self.futures_sio.sleep(0.25)
             now = time.monotonic()
             if now >= next_heartbeat:
                 print(json.dumps({
@@ -330,14 +389,21 @@ class Collector:
                     "time_utc": utc_iso(),
                     "elapsed_seconds": round(time.time() - self.start_epoch, 3),
                     "event_counts": dict(self.event_counts),
+                    "futures_event_counts": dict(self.futures_event_counts),
                     "last_event_age_seconds": round(now - self.last_event_monotonic, 3),
                 }), flush=True)
                 next_heartbeat = now + heartbeat_every
 
-        try:
-            self.sio.disconnect()
-        except Exception as exc:
-            self._record_error("socket_disconnect", exc)
+        if spot_connected:
+            try:
+                self.sio.disconnect()
+            except Exception as exc:
+                self._record_error("spot:socket_disconnect", exc)
+        if futures_connected:
+            try:
+                self.futures_sio.disconnect()
+            except Exception as exc:
+                self._record_error("futures:socket_disconnect", exc)
 
         for writer in self.raw_writers.values():
             writer.close()
@@ -356,12 +422,15 @@ class Collector:
             "futures_streams": ["new-trade", "price-change", "current-prices"] if futures_enabled else [],
             "orderbook_channel_depth": depth,
             "socket_url": self.cfg["coindcx"]["socket_url"],
+            "futures_socket_url": self.cfg["coindcx"].get("futures_socket_url"),
             "python_socketio_version": socketio_version(),
-            "join_channels": self.join_channels,
+            "join_channels": sorted(channels),
             "futures_join_channels": self.futures_join_channels,
             "join_emissions": self.join_emissions,
+            "futures_join_emissions": self.futures_join_emissions,
             "connection_events": self.connection_events,
             "reconnect_count": self.reconnect_count,
+            "futures_reconnect_count": self.futures_reconnect_count,
             "event_counts": dict(self.event_counts),
             "futures_event_counts": dict(self.futures_event_counts),
             "unknown_events": dict(self.unknown_events),
@@ -374,7 +443,7 @@ class Collector:
             ],
         }
         (self.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        futures_required = ["new-trade", "current-prices"] if futures_enabled else []
+        futures_required = ["new-trade", "price-change", "current-prices"] if futures_enabled else []
         futures_missing = [k for k in futures_required if self.futures_event_counts.get(k, 0) == 0]
         quality = {
             "status": "PASS" if not self.errors else "PASS_WITH_ERRORS",
