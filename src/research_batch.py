@@ -258,6 +258,7 @@ def _apply_delta_metrics_placeholder() -> tuple[float, float, int]:
 def build_seconds(batch: Path) -> list[dict[str, Any]]:
     trade_path = batch / "trades.jsonl.gz"
     price_path = batch / "price_change.jsonl.gz"
+    futures_trade_path = batch / "futures_trades.jsonl.gz"
 
     rows: dict[tuple[str, int], dict[str, Any]] = {}
 
@@ -284,6 +285,17 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
                 "depth_update_events": 0,
                 "depth_snapshot_events": 0,
                 "last_depth_version": None,
+                "futures_trade_count": 0,
+                "futures_aggressive_buy_qty": 0.0,
+                "futures_aggressive_sell_qty": 0.0,
+                "futures_aggressive_buy_notional": 0.0,
+                "futures_aggressive_sell_notional": 0.0,
+                "futures_delta_qty": 0.0,
+                "futures_delta_notional": 0.0,
+                "futures_total_qty": 0.0,
+                "futures_total_notional": 0.0,
+                "futures_last_trade_price": None,
+                "futures_last_trade_exchange_ms": None,
             }
         return rows[key]
 
@@ -314,6 +326,35 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
                 r["aggressive_buy_qty"] += q
                 r["aggressive_buy_notional"] += notion
 
+    if futures_trade_path.exists():
+        for rec in read_gz_jsonl(futures_trade_path):
+            data = extract_payload_data(rec)
+            if str(data.get("pr", "")).lower() not in {"f", "futures"}:
+                continue
+            symbol = canonical_symbol(data.get("s") or rec.get("pair"))
+            if symbol is None:
+                continue
+            t = data.get("T", rec.get("exchange_timestamp_ms"))
+            p = safe_float(data.get("p"))
+            q = safe_float(data.get("q"))
+            if t is None or p is None or q is None:
+                continue
+            t_ms = int(t)
+            r = row(symbol, sec_bucket(t_ms))
+            maker_buyer = bool(data.get("m"))
+            notion = p * q
+            r["futures_trade_count"] += 1
+            r["futures_total_qty"] += q
+            r["futures_total_notional"] += notion
+            r["futures_last_trade_price"] = p
+            r["futures_last_trade_exchange_ms"] = t_ms
+            if maker_buyer:
+                r["futures_aggressive_sell_qty"] += q
+                r["futures_aggressive_sell_notional"] += notion
+            else:
+                r["futures_aggressive_buy_qty"] += q
+                r["futures_aggressive_buy_notional"] += notion
+
     if price_path.exists():
         for rec in read_gz_jsonl(price_path):
             data = extract_payload_data(rec)
@@ -338,6 +379,11 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
         r["depth_update_events"] = features.get("depth_update_events", r["depth_update_events"])
         r["depth_snapshot_events"] = features.get("depth_snapshot_events", r["depth_snapshot_events"])
         r["last_depth_version"] = features.get("depth_version")
+
+    for r in rows.values():
+        r["futures_delta_qty"] = r["futures_aggressive_buy_qty"] - r["futures_aggressive_sell_qty"]
+        r["futures_delta_notional"] = r["futures_aggressive_buy_notional"] - r["futures_aggressive_sell_notional"]
+        r["futures_delta_ratio"] = r["futures_delta_qty"] / r["futures_total_qty"] if r["futures_total_qty"] else None
 
     by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows.values():
@@ -365,6 +411,21 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
                 total = sum(x["total_qty"] for x in window_rows)
                 r[f"delta_ratio_{w}s"] = r[f"delta_qty_{w}s"] / total if total else None
                 r[f"trade_count_{w}s"] = sum(x["trade_count"] for x in window_rows)
+
+                f_buy = sum(x["futures_aggressive_buy_qty"] for x in window_rows)
+                f_sell = sum(x["futures_aggressive_sell_qty"] for x in window_rows)
+                f_delta = f_buy - f_sell
+                f_total = sum(x["futures_total_qty"] for x in window_rows)
+                r[f"futures_buy_qty_{w}s"] = f_buy
+                r[f"futures_sell_qty_{w}s"] = f_sell
+                r[f"futures_delta_qty_{w}s"] = f_delta
+                r[f"futures_delta_notional_{w}s"] = sum(x["futures_delta_notional"] for x in window_rows)
+                r[f"futures_total_qty_{w}s"] = f_total
+                r[f"futures_delta_ratio_{w}s"] = f_delta / f_total if f_total else None
+                r[f"futures_trade_count_{w}s"] = sum(x["futures_trade_count"] for x in window_rows)
+                sr = r[f"delta_ratio_{w}s"]
+                fr = r[f"futures_delta_ratio_{w}s"]
+                r[f"futures_spot_delta_divergence_{w}s"] = fr - sr if fr is not None and sr is not None else None
             final.append(r.copy())
 
     final.sort(key=lambda x: (x["symbol"], x["epoch_second"]))
@@ -436,8 +497,18 @@ def aggregate_1m(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "depth_update_events": sum(int(x.get("depth_update_events") or 0) for x in rs),
             "depth_snapshot_events": sum(int(x.get("depth_snapshot_events") or 0) for x in rs),
             "book_valid_seconds": sum(1 for x in rs if x.get("book_valid")),
+            "futures_trade_count": sum(int(x.get("futures_trade_count") or 0) for x in rs),
+            "futures_aggressive_buy_qty": sum(float(x.get("futures_aggressive_buy_qty") or 0.0) for x in rs),
+            "futures_aggressive_sell_qty": sum(float(x.get("futures_aggressive_sell_qty") or 0.0) for x in rs),
+            "futures_delta_qty": sum(float(x.get("futures_delta_qty") or 0.0) for x in rs),
+            "futures_delta_notional": sum(float(x.get("futures_delta_notional") or 0.0) for x in rs),
+            "futures_total_qty": sum(float(x.get("futures_total_qty") or 0.0) for x in rs),
+            "futures_delta_ratio": (sum(float(x.get("futures_delta_qty") or 0.0) for x in rs) /
+                                    sum(float(x.get("futures_total_qty") or 0.0) for x in rs)
+                                    if sum(float(x.get("futures_total_qty") or 0.0) for x in rs) else None),
+            "futures_last_trade_price": next((x.get("futures_last_trade_price") for x in reversed(rs) if x.get("futures_last_trade_price") is not None), None),
             "book_features_status": BOOK_STATUS,
-            "source_schema": "research_batch_v4",
+            "source_schema": "research_batch_v5",
         })
     return out
 
@@ -489,8 +560,18 @@ def aggregate_3m(minute_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "depth_update_events": sum(int(r.get("depth_update_events") or 0) for r in rs),
             "depth_snapshot_events": sum(int(r.get("depth_snapshot_events") or 0) for r in rs),
             "book_valid_seconds": sum(int(r.get("book_valid_seconds") or 0) for r in rs),
+            "futures_trade_count": sum(int(r.get("futures_trade_count") or 0) for r in rs),
+            "futures_aggressive_buy_qty": sum(float(r.get("futures_aggressive_buy_qty") or 0.0) for r in rs),
+            "futures_aggressive_sell_qty": sum(float(r.get("futures_aggressive_sell_qty") or 0.0) for r in rs),
+            "futures_delta_qty": sum(float(r.get("futures_delta_qty") or 0.0) for r in rs),
+            "futures_delta_notional": sum(float(r.get("futures_delta_notional") or 0.0) for r in rs),
+            "futures_total_qty": sum(float(r.get("futures_total_qty") or 0.0) for r in rs),
+            "futures_delta_ratio": (sum(float(r.get("futures_delta_qty") or 0.0) for r in rs) /
+                                    sum(float(r.get("futures_total_qty") or 0.0) for r in rs)
+                                    if sum(float(r.get("futures_total_qty") or 0.0) for r in rs) else None),
+            "futures_last_trade_price": next((r.get("futures_last_trade_price") for r in reversed(rs) if r.get("futures_last_trade_price") is not None), None),
             "book_features_status": BOOK_STATUS,
-            "source_schema": "research_batch_v4",
+            "source_schema": "research_batch_v5",
             "complete_minutes": 3,
         })
     return out
@@ -517,11 +598,13 @@ def main() -> int:
         "forward_labels": list(FORWARD_HORIZONS),
         "long_horizon_labels_seconds": [300, 600, 900, 1800],
         "book_features_status": BOOK_STATUS,
+        "futures_data": "Public BTC/USDT + ETH/USDT Futures trades are captured as additive features; no Open Interest is synthesized.",
         "book_features": [
             "best_bid", "best_ask", "mid_price", "spread_abs", "spread_bps", "microprice",
             "book_bid_qty_1/5/10/20", "book_ask_qty_1/5/10/20", "book_imbalance_1/5/10/20",
         ],
         "book_reconstruction": "Absolute price-level replacements from validated depth updates, re-anchored at snapshots and invalidated across version discontinuities.",
+        "futures_research": "Futures Delta remains separate from Spot Delta so lead/lag, agreement, disagreement, and divergence can be tested without changing the original Spot definitions.",
         "bars_3m_definition": "UTC-aligned aggregation of three complete 1m buckets derived from live raw trades/features; incomplete boundary buckets excluded.",
     }
     (batch / "research_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

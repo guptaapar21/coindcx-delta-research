@@ -4,7 +4,10 @@
 Design goals:
 - Capture raw websocket payloads first; do not make unverified depth assumptions.
 - Keep exchange timestamp and local receive timestamp.
-- Capture trades, depth-update, depth-snapshot and price-change.
+- Capture spot trades, depth-update, depth-snapshot and price-change.
+- Capture public futures trades and price-change for BTC/USDT + ETH/USDT.
+- Capture only the BTC/USDT + ETH/USDT slice from the public futures
+  current-prices stream to avoid storing the entire multi-asset futures feed.
 - No 15m/1h/1d live candle streams are joined.
 - Each run is an independent batch with an auditable manifest.
 """
@@ -97,6 +100,11 @@ class Collector:
         "depth-update": "depth_update.jsonl.gz",
         "depth-snapshot": "depth_snapshot.jsonl.gz",
     }
+    FUTURES_EVENT_FILES = {
+        "new-trade": "futures_trades.jsonl.gz",
+        "price-change": "futures_price_change.jsonl.gz",
+        "current-prices": "futures_current_prices.jsonl.gz",
+    }
 
     def __init__(self, cfg: dict[str, Any], out_dir: Path, duration_minutes: float) -> None:
         self.cfg = cfg
@@ -111,11 +119,14 @@ class Collector:
         )
         self.session = requests.Session()
         self.event_counts = Counter()
+        self.futures_event_counts = Counter()
         self.raw_writers: dict[str, JsonlGzWriter] = {}
         self.unknown_events = Counter()
         self.errors: list[dict[str, Any]] = []
         self.connection_events: list[dict[str, Any]] = []
         self.join_channels: list[str] = []
+        self.futures_join_channels: list[str] = []
+        self.futures_pairs: set[str] = set()
         self.join_emissions = 0
         self.reconnect_count = 0
         self.start_epoch = time.time()
@@ -129,10 +140,12 @@ class Collector:
         self.errors.append(entry)
         print(json.dumps(entry), flush=True)
 
-    def _writer_for(self, event_name: str) -> JsonlGzWriter:
-        if event_name not in self.raw_writers:
-            self.raw_writers[event_name] = JsonlGzWriter(self.out_dir / self.EVENT_FILES[event_name])
-        return self.raw_writers[event_name]
+    def _writer_for(self, event_name: str, futures: bool = False) -> JsonlGzWriter:
+        files = self.FUTURES_EVENT_FILES if futures else self.EVENT_FILES
+        key = f"futures:{event_name}" if futures else event_name
+        if key not in self.raw_writers:
+            self.raw_writers[key] = JsonlGzWriter(self.out_dir / files[event_name])
+        return self.raw_writers[key]
 
     @staticmethod
     def _payload(event_name: str, response: Any) -> dict[str, Any]:
@@ -154,7 +167,11 @@ class Collector:
                 pass
         return payload
 
-    def _write_event(self, event_name: str, response: Any) -> None:
+    @staticmethod
+    def _is_futures_data(data: dict[str, Any]) -> bool:
+        return str(data.get("pr", "")).lower() in {"f", "futures"}
+
+    def _write_event(self, event_name: str, response: Any, futures: bool = False) -> None:
         received_ms = utc_now_ms()
         received_ns = time.time_ns()
         payload = self._payload(event_name, response)
@@ -164,12 +181,14 @@ class Collector:
             "received_at_ms": received_ms,
             "received_at_ns": received_ns,
             "event": event_name,
+            "market": "futures" if futures else "spot",
             "exchange_timestamp_ms": data.get("T", data.get("ts")),
             "pair": data.get("s"),
             "raw": payload,
         }
-        self._writer_for(event_name).write(record)
-        self.event_counts[event_name] += 1
+        self._writer_for(event_name, futures=futures).write(record)
+        counter = self.futures_event_counts if futures else self.event_counts
+        counter[event_name] += 1
         self.last_event_monotonic = time.monotonic()
         ex = record["exchange_timestamp_ms"]
         if ex is not None:
@@ -180,6 +199,32 @@ class Collector:
                 self.last_event_exchange_ms[key] = ex_i
             except (TypeError, ValueError):
                 pass
+
+    def _write_futures_current_prices(self, response: Any, target_pairs: set[str], event_name: str) -> None:
+        received_ms = utc_now_ms()
+        received_ns = time.time_ns()
+        payload = self._payload("current-prices", response)
+        data = self._extract_data(payload)
+        prices = data.get("prices") if isinstance(data, dict) else None
+        if not isinstance(prices, dict):
+            return
+        selected = {str(pair): value for pair, value in prices.items() if str(pair) in target_pairs}
+        if not selected:
+            return
+        record = {
+            "received_at_utc": datetime.fromtimestamp(received_ms / 1000, tz=timezone.utc).isoformat(),
+            "received_at_ms": received_ms,
+            "received_at_ns": received_ns,
+            "event": event_name,
+            "market": "futures",
+            "exchange_timestamp_ms": data.get("ts"),
+            "stream_timestamp_ms": data.get("pST"),
+            "version": data.get("vs"),
+            "pairs": selected,
+        }
+        self._writer_for("current-prices", futures=True).write(record)
+        self.futures_event_counts["current-prices"] += 1
+        self.last_event_monotonic = time.monotonic()
 
     def _register_handlers(self) -> None:
         @self.sio.event
@@ -201,11 +246,15 @@ class Collector:
 
         @self.sio.on("new-trade")
         def on_trade(response):
-            self._write_event("new-trade", response)
+            payload = self._payload("new-trade", response)
+            data = self._extract_data(payload)
+            self._write_event("new-trade", response, futures=self._is_futures_data(data))
 
         @self.sio.on("price-change")
         def on_price(response):
-            self._write_event("price-change", response)
+            payload = self._payload("price-change", response)
+            data = self._extract_data(payload)
+            self._write_event("price-change", response, futures=self._is_futures_data(data))
 
         @self.sio.on("depth-update")
         def on_depth_update(response):
@@ -214,6 +263,14 @@ class Collector:
         @self.sio.on("depth-snapshot")
         def on_depth_snapshot(response):
             self._write_event("depth-snapshot", response)
+
+        @self.sio.on("currentPrices@futures#update")
+        def on_futures_current_prices(response):
+            self._write_futures_current_prices(response, self.futures_pairs, "currentPrices@futures#update")
+
+        @self.sio.on("currentPrices@futures#snapshot")
+        def on_futures_current_prices_snapshot(response):
+            self._write_futures_current_prices(response, self.futures_pairs, "currentPrices@futures#snapshot")
 
         @self.sio.on("*")
         def on_catch_all(event, *args):
@@ -233,7 +290,19 @@ class Collector:
                 f"{pair}@orderbook@{depth}",
                 f"{pair}@prices",
             ])
-        self.join_channels = sorted(channels)
+
+        futures_enabled = bool(self.cfg["coindcx"].get("futures_enabled", True))
+        futures_cfg = self.cfg["coindcx"].get("futures_symbols", self.cfg["coindcx"]["symbols"])
+        self.futures_pairs = {str(x["pair"]) for x in futures_cfg}
+        self.futures_join_channels = []
+        if futures_enabled:
+            self.futures_join_channels = ["currentPrices@futures@rt"]
+            for pair in sorted(self.futures_pairs):
+                self.futures_join_channels.extend([
+                    f"{pair}@trades-futures",
+                    f"{pair}@prices-futures",
+                ])
+        self.join_channels = sorted(channels) + self.futures_join_channels
         self.connection_events.append({"time_utc": utc_iso(), "state": "starting", "channels": self.join_channels})
 
         signal.signal(signal.SIGINT, self.stop)
@@ -284,25 +353,35 @@ class Collector:
             "requested_duration_seconds": self.duration_seconds,
             "symbols": pairs,
             "streams": ["new-trade", "depth-update", "depth-snapshot", "price-change"],
+            "futures_streams": ["new-trade", "price-change", "current-prices"] if futures_enabled else [],
             "orderbook_channel_depth": depth,
             "socket_url": self.cfg["coindcx"]["socket_url"],
             "python_socketio_version": socketio_version(),
             "join_channels": self.join_channels,
+            "futures_join_channels": self.futures_join_channels,
             "join_emissions": self.join_emissions,
             "connection_events": self.connection_events,
             "reconnect_count": self.reconnect_count,
             "event_counts": dict(self.event_counts),
+            "futures_event_counts": dict(self.futures_event_counts),
             "unknown_events": dict(self.unknown_events),
             "errors": self.errors,
             "notes": [
                 "Raw depth payloads are preserved without assuming incremental semantics.",
+                "Public futures trades/price changes are captured separately; futures current-prices are filtered to configured BTC/USDT + ETH/USDT pairs.",
+                "Futures OI is not assumed or synthesized; only fields actually present in public payloads are preserved.",
                 "Depth-derived imbalance/microprice features remain uncertified until depth semantics validation passes.",
             ],
         }
         (self.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        futures_required = ["new-trade", "current-prices"] if futures_enabled else []
+        futures_missing = [k for k in futures_required if self.futures_event_counts.get(k, 0) == 0]
         quality = {
             "status": "PASS" if not self.errors else "PASS_WITH_ERRORS",
             "required_event_counts": {k: int(self.event_counts.get(k, 0)) for k in self.EVENT_FILES},
+            "futures_event_counts": dict(self.futures_event_counts),
+            "futures_status": ("PASS" if futures_enabled and not futures_missing else "WARN_MISSING_FUTURES") if futures_enabled else "DISABLED",
+            "missing_futures_streams": futures_missing,
             "missing_required_streams": [k for k in self.EVENT_FILES if self.event_counts.get(k, 0) == 0],
             "exchange_timestamp_ranges": {
                 k: {
