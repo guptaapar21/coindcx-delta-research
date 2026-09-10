@@ -15,3 +15,8 @@ A GitHub-hosted workflow cannot directly place an archive into a user's local ph
 ## Scheduler reliability
 
 The self-chain uses `repository_dispatch`, which GitHub documents as an event that creates a new workflow run even when the dispatch is made using `GITHUB_TOKEN`. The watchdog exists because any cloud workflow can fail or become stale.
+
+
+## Longer-horizon research labels
+
+The current flow-window definitions remain 5/15/30/60/180 seconds. Longer horizons are represented as forward-response labels at 5/10/15/30 minutes rather than expanding the rolling-flow feature set. The compact merge step recalculates those labels from the full accumulated compact history to preserve future bars that fall in the next collector batch.

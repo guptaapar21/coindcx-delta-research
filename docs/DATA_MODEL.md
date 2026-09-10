@@ -48,3 +48,10 @@ Contains compact 1-minute price/flow features suitable for longer retention and 
 ## 3-minute live research layer
 
 The live 3-minute layer is derived from the live 1-minute layer, not from CoinDCX's higher-timeframe candle feed. UTC-aligned 180-second buckets are used, and a 3-minute bar is emitted only when all three constituent 1-minute buckets are present. The canonical key is `(symbol, three_minute_epoch)`.
+
+
+## Forward-response horizon labels
+
+The 1-second research layer retains the five rolling order-flow windows (5/15/30/60/180s). It additionally records forward price-return labels at 300s, 600s, 900s and 1800s so the same microstructure observation can be evaluated over longer response horizons.
+
+The canonical 1-minute and 3-minute compact layers add longer forward close-to-close labels after merge. Recalculation occurs over the merged compact history rather than an individual collector batch, so labels are not systematically lost at 230-minute batch boundaries. These longer labels are research diagnostics, not trading rules.
