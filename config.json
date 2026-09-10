@@ -3,8 +3,14 @@
     "base_api": "https://api.coindcx.com",
     "socket_url": "https://stream-spot.coindcx.com",
     "symbols": [
-      {"name": "BTC/USDT", "pair": "B-BTC_USDT"},
-      {"name": "ETH/USDT", "pair": "B-ETH_USDT"}
+      {
+        "name": "BTC/USDT",
+        "pair": "B-BTC_USDT"
+      },
+      {
+        "name": "ETH/USDT",
+        "pair": "B-ETH_USDT"
+      }
     ],
     "orderbook_depth": 50
   },
@@ -17,7 +23,13 @@
     "raw_compression": "gzip"
   },
   "research": {
-    "windows_seconds": [5, 15, 30, 60, 180],
+    "windows_seconds": [
+      5,
+      15,
+      30,
+      60,
+      180
+    ],
     "compact_retention_days": 90,
     "raw_archive_after_hours": 48
   },

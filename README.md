@@ -9,7 +9,8 @@ This package is the production-oriented next stage for the CoinDCX Delta/order-f
 - No live 15m/1h/1d candle streams.
 - Our own 1m/3m research bars are derived from the live raw trades/features. The 3m layer is built from three complete UTC-aligned 1m buckets; incomplete boundary buckets are excluded.
 - Short order-flow windows: 5s, 15s, 30s, 60s, 180s.
-- Forward labels: +5s, +15s, +30s, +60s, +180s.
+- Microstructure forward labels: +5s, +15s, +30s, +60s, +180s.
+- Longer response labels: +5m, +10m, +15m, +30m; these are labels only, not additional rolling-flow windows.
 - MFE/MAE hooks can be added after the first stable feature pass.
 - Depth-derived imbalance/microprice/pressure are **disabled as trusted features** until the empirical depth validator provides enough evidence to justify reconstruction.
 
@@ -59,6 +60,10 @@ python tools/sync_archives.py --repo guptaapar21/coindcx-delta-research --dest .
 ```
 
 Schedule that command using the operating system scheduler. Because release assets are public downloads, the script does not require a token for a public repository.
+
+## Research horizon layers
+
+The collector and core order-flow windows remain unchanged. The research layer now measures how long any signal response persists by adding forward-return labels at +5m, +10m, +15m and +30m. The long-horizon labels are recalculated from the merged compact history, which preserves labels that cross independent 230-minute collector-batch boundaries. The intended workflow is to use 5s–3m as microstructure diagnostics and the 5m–30m labels as the trading-horizon discovery layer. No trading strategy is implied by these labels.
 
 ## Live 3-minute layer
 
