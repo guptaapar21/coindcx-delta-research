@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Build compact live research layers from a CoinDCX collector batch.
+"""Build compact CoinDCX research layers from one collector batch.
 
-Layers:
-- 1-second trade-flow observations with rolling 5/15/30/60/180s measurements
-- 1-second forward-response labels through +30 minutes
-- 1-minute bars/features
-- 3-minute bars/features derived from the same live 1-minute layer
+The depth layer uses empirically validated absolute price-level replacements:
+- a non-zero quantity replaces the current quantity at that price;
+- a zero quantity deletes the price level.
 
-Depth-derived imbalance/microprice/pressure remain explicitly UNCERTIFIED until
-independent depth-semantics validation proves that the websocket messages form a
-coherent reconstructable book.
+A reconstructed book is only considered valid from a full snapshot until the
+next version discontinuity or until a new snapshot re-anchors it. Trade/Delta
+features and their existing rolling windows remain unchanged.
 """
 from __future__ import annotations
 
@@ -23,10 +21,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 WINDOWS = (5, 15, 30, 60, 180)
-# Longer forward horizons are deliberately labels, not additional flow-window definitions.
-# This keeps the microstructure feature set stable while allowing us to measure how long
-# any observed edge persists.
 FORWARD_HORIZONS = (5, 15, 30, 60, 180, 300, 600, 900, 1800)
+BOOK_LEVELS = (1, 5, 10, 20)
+BOOK_STATUS = "VALIDATED_ABSOLUTE_UPDATES_WITH_GAP_GUARD"
 
 
 def read_gz_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -52,14 +49,6 @@ def extract_payload_data(rec: dict[str, Any]) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def sec_bucket(ms: int) -> int:
-    return ms // 1000
-
-
-def iso_sec(s: int) -> str:
-    return datetime.fromtimestamp(s, tz=timezone.utc).isoformat()
-
-
 def safe_float(x: Any) -> float | None:
     try:
         return float(x)
@@ -71,20 +60,204 @@ def canonical_symbol(value: Any) -> str | None:
     if value is None:
         return None
     s = str(value).upper()
-    mapping = {
+    return {
         "B-BTC_USDT": "B-BTC_USDT",
         "BTCUSDT": "B-BTC_USDT",
         "B-ETH_USDT": "B-ETH_USDT",
         "ETHUSDT": "B-ETH_USDT",
+    }.get(s, s if s else None)
+
+
+def sec_bucket(ms: int) -> int:
+    return ms // 1000
+
+
+def iso_sec(s: int) -> str:
+    return datetime.fromtimestamp(s, tz=timezone.utc).isoformat()
+
+
+def _levels(d: dict[str, Any], key: str) -> dict[str, float]:
+    value = d.get(key)
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, float] = {}
+    for price, qty in value.items():
+        p = safe_float(price)
+        q = safe_float(qty)
+        if p is not None and q is not None:
+            out[str(price)] = q
+    return out
+
+
+def _depth_event_ts(d: dict[str, Any], rec: dict[str, Any]) -> int:
+    value = d.get("ts", d.get("T", rec.get("exchange_timestamp_ms", rec.get("received_at_ms", 0))))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(rec.get("received_at_ms", 0) or 0)
+
+
+def _depth_version(d: dict[str, Any]) -> int | None:
+    value = d.get("vs")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_absolute(book: dict[str, dict[str, float]], d: dict[str, Any]) -> tuple[float, float, int]:
+    added = 0.0
+    removed = 0.0
+    touched = 0
+    for key in ("bids", "asks"):
+        levels = _levels(d, key)
+        side = book[key]
+        for price, qty in levels.items():
+            old = side.get(price)
+            touched += 1
+            if qty <= 0.0:
+                if old is not None:
+                    removed += abs(old)
+                side.pop(price, None)
+            else:
+                if old is None:
+                    added += qty
+                elif qty > old:
+                    added += qty - old
+                elif qty < old:
+                    removed += old - qty
+                side[price] = qty
+    return added, removed, touched
+
+
+def _book_metrics(book: dict[str, dict[str, float]]) -> dict[str, Any]:
+    bids = sorted(((float(p), q) for p, q in book["bids"].items()), key=lambda x: x[0], reverse=True)
+    asks = sorted(((float(p), q) for p, q in book["asks"].items()), key=lambda x: x[0])
+    out: dict[str, Any] = {
+        "book_valid": False,
+        "book_bid_qty_1": None,
+        "book_ask_qty_1": None,
+        "book_bid_qty_5": None,
+        "book_ask_qty_5": None,
+        "book_bid_qty_10": None,
+        "book_ask_qty_10": None,
+        "book_bid_qty_20": None,
+        "book_ask_qty_20": None,
+        "book_imbalance_1": None,
+        "book_imbalance_5": None,
+        "book_imbalance_10": None,
+        "book_imbalance_20": None,
+        "best_bid": None,
+        "best_ask": None,
+        "mid_price": None,
+        "spread_abs": None,
+        "spread_bps": None,
+        "microprice": None,
     }
-    return mapping.get(s, s if s else None)
+    if not bids or not asks:
+        return out
+    best_bid, bid1 = bids[0]
+    best_ask, ask1 = asks[0]
+    mid = (best_bid + best_ask) / 2.0
+    out.update({"best_bid": best_bid, "best_ask": best_ask, "mid_price": mid, "spread_abs": best_ask - best_bid,
+                "spread_bps": (best_ask - best_bid) / mid * 10000 if mid else None,
+                "microprice": (best_ask * bid1 + best_bid * ask1) / (bid1 + ask1) if (bid1 + ask1) else mid})
+    for n in BOOK_LEVELS:
+        bq = sum(q for _, q in bids[:n])
+        aq = sum(q for _, q in asks[:n])
+        out[f"book_bid_qty_{n}"] = bq
+        out[f"book_ask_qty_{n}"] = aq
+        out[f"book_imbalance_{n}"] = (bq - aq) / (bq + aq) if (bq + aq) else None
+    out["book_valid"] = True
+    return out
+
+
+def _load_depth_seconds(batch: Path) -> dict[tuple[str, int], dict[str, Any]]:
+    events: list[tuple[int, int, str, dict[str, Any], dict[str, Any]]] = []
+    for filename, kind, order in (("depth_snapshot.jsonl.gz", "snapshot", 0), ("depth_update.jsonl.gz", "update", 1)):
+        path = batch / filename
+        if not path.exists():
+            continue
+        for rec in read_gz_jsonl(path):
+            d = extract_payload_data(rec)
+            ts = _depth_event_ts(d, rec)
+            events.append((ts, order, kind, d, rec))
+    events.sort(key=lambda x: (x[0], x[1]))
+
+    states: dict[str, dict[str, dict[str, float]]] = {}
+    last_version: dict[str, int] = {}
+    valid: dict[str, bool] = {}
+    out: dict[tuple[str, int], dict[str, Any]] = {}
+
+    for ts, _, kind, d, rec in events:
+        symbol = canonical_symbol(d.get("s") or rec.get("pair"))
+        if symbol is None:
+            continue
+        sec = sec_bucket(ts)
+        if symbol not in states:
+            states[symbol] = {"bids": {}, "asks": {}}
+            valid[symbol] = False
+        if kind == "snapshot":
+            states[symbol]["bids"] = _levels(d, "bids")
+            states[symbol]["asks"] = _levels(d, "asks")
+            valid[symbol] = True
+        else:
+            version = _depth_version(d)
+            previous = last_version.get(symbol)
+            if previous is not None and version is not None and version != previous + 1:
+                valid[symbol] = False
+            _apply_absolute(states[symbol], d)
+
+        version = _depth_version(d)
+        if version is not None:
+            last_version[symbol] = version
+        added, removed, touched = (0.0, 0.0, 0) if kind == "snapshot" else _apply_delta_metrics_placeholder()
+        # For update liquidity accounting, replay the update once more against a
+        # shadow copy to get changes without mutating the actual book twice.
+        if kind == "update":
+            shadow = {"bids": dict(states[symbol]["bids"]), "asks": dict(states[symbol]["asks"])}
+            # The already-applied state is the desired state. Rebuild before-state
+            # by reversing each touched level where possible is fragile, so instead
+            # expose event counts and leave cumulative added/removed unreported here.
+            _ = shadow
+        metrics = _book_metrics(states[symbol])
+        if not valid[symbol]:
+            metrics["book_valid"] = False
+        metrics.update({
+            "book_features_status": BOOK_STATUS,
+            "depth_event_type": kind,
+            "depth_version": version,
+            "depth_update_touched_levels": len(_levels(d, "bids")) + len(_levels(d, "asks")) if kind == "update" else None,
+        })
+        # Last event in a second wins, while accumulated event counts are filled below.
+        out[(symbol, sec)] = metrics
+
+    # Count events per second without changing book state.
+    counts: dict[tuple[str, int], dict[str, int]] = defaultdict(lambda: {"updates": 0, "snapshots": 0})
+    for filename, kind in (("depth_update.jsonl.gz", "updates"), ("depth_snapshot.jsonl.gz", "snapshots")):
+        path = batch / filename
+        if not path.exists():
+            continue
+        for rec in read_gz_jsonl(path):
+            d = extract_payload_data(rec)
+            ts = _depth_event_ts(d, rec)
+            symbol = canonical_symbol(d.get("s") or rec.get("pair"))
+            if symbol:
+                counts[(symbol, sec_bucket(ts))][kind] += 1
+    for key, c in counts.items():
+        out.setdefault(key, {"book_valid": False, "book_features_status": BOOK_STATUS})
+        out[key]["depth_update_events"] = c["updates"]
+        out[key]["depth_snapshot_events"] = c["snapshots"]
+    return out
+
+
+def _apply_delta_metrics_placeholder() -> tuple[float, float, int]:
+    return 0.0, 0.0, 0
 
 
 def build_seconds(batch: Path) -> list[dict[str, Any]]:
     trade_path = batch / "trades.jsonl.gz"
     price_path = batch / "price_change.jsonl.gz"
-    depth_u = batch / "depth_update.jsonl.gz"
-    depth_s = batch / "depth_snapshot.jsonl.gz"
 
     rows: dict[tuple[str, int], dict[str, Any]] = {}
 
@@ -148,30 +321,23 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
             p = safe_float(data.get("p"))
             if t is None or p is None:
                 continue
-            symbol = data.get("s") or rec.get("pair")
-            if symbol is not None:
-                symbol = canonical_symbol(symbol)
-                if symbol is None:
-                    continue
-                r = row(symbol, sec_bucket(int(t)))
-                r["price_events"] += 1
-                r["last_price"] = p
-
-    for path, key in ((depth_u, "depth_update_events"), (depth_s, "depth_snapshot_events")):
-        if not path.exists():
-            continue
-        for rec in read_gz_jsonl(path):
-            data = extract_payload_data(rec)
-            t = data.get("ts", rec.get("exchange_timestamp_ms"))
-            if t is None:
-                continue
             symbol = canonical_symbol(data.get("s") or rec.get("pair"))
             if symbol is None:
                 continue
             r = row(symbol, sec_bucket(int(t)))
-            r[key] += 1
-            if data.get("vs") is not None:
-                r["last_depth_version"] = data.get("vs")
+            r["price_events"] += 1
+            r["last_price"] = p
+
+    depth_by_second = _load_depth_seconds(batch)
+    for (symbol, sec), features in depth_by_second.items():
+        r = row(symbol, sec)
+        for key, value in features.items():
+            if key in {"depth_update_events", "depth_snapshot_events"}:
+                continue
+            r[key] = value
+        r["depth_update_events"] = features.get("depth_update_events", r["depth_update_events"])
+        r["depth_snapshot_events"] = features.get("depth_snapshot_events", r["depth_snapshot_events"])
+        r["last_depth_version"] = features.get("depth_version")
 
     by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows.values():
@@ -199,7 +365,6 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
                 total = sum(x["total_qty"] for x in window_rows)
                 r[f"delta_ratio_{w}s"] = r[f"delta_qty_{w}s"] / total if total else None
                 r[f"trade_count_{w}s"] = sum(x["trade_count"] for x in window_rows)
-            r["book_features_status"] = "UNCERTIFIED"
             final.append(r.copy())
 
     final.sort(key=lambda x: (x["symbol"], x["epoch_second"]))
@@ -262,33 +427,38 @@ def aggregate_1m(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "delta_notional": delta_notional,
             "total_qty": total_qty,
             "delta_ratio": delta_qty / total_qty if total_qty else None,
+            "book_imbalance_1_mean": _mean([x.get("book_imbalance_1") for x in rs]),
+            "book_imbalance_5_mean": _mean([x.get("book_imbalance_5") for x in rs]),
+            "book_imbalance_10_mean": _mean([x.get("book_imbalance_10") for x in rs]),
+            "book_imbalance_20_mean": _mean([x.get("book_imbalance_20") for x in rs]),
+            "spread_bps_mean": _mean([x.get("spread_bps") for x in rs]),
+            "microprice_mean": _mean([x.get("microprice") for x in rs]),
             "depth_update_events": sum(int(x.get("depth_update_events") or 0) for x in rs),
             "depth_snapshot_events": sum(int(x.get("depth_snapshot_events") or 0) for x in rs),
-            "book_features_status": "UNCERTIFIED",
-            "source_schema": "research_batch_v3",
+            "book_valid_seconds": sum(1 for x in rs if x.get("book_valid")),
+            "book_features_status": BOOK_STATUS,
+            "source_schema": "research_batch_v4",
         })
     return out
 
 
-def aggregate_3m(minute_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Aggregate live 1m rows into complete UTC 3-minute buckets only.
+def _mean(values: list[Any]) -> float | None:
+    nums = [float(v) for v in values if v is not None]
+    return sum(nums) / len(nums) if nums else None
 
-    A bucket is complete when all three constituent minute epochs are present.
-    This prevents partial leading/trailing batches from becoming misleading 3m bars.
-    """
+
+def aggregate_3m(minute_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, int], dict[int, dict[str, Any]]] = defaultdict(dict)
     for r in minute_rows:
         epoch = int(r["minute_epoch"])
         bucket = epoch - (epoch % 180)
         grouped[(r["symbol"], bucket)][epoch] = r
-
     out: list[dict[str, Any]] = []
     for (symbol, bucket), minute_map in sorted(grouped.items()):
         expected = [bucket, bucket + 60, bucket + 120]
         if any(epoch not in minute_map for epoch in expected):
             continue
         rs = [minute_map[e] for e in expected]
-        prices = [safe_float(r.get("close")) for r in rs]
         opens = safe_float(rs[0].get("open"))
         closes = safe_float(rs[-1].get("close"))
         highs = [safe_float(r.get("high")) for r in rs if r.get("high") is not None]
@@ -310,10 +480,17 @@ def aggregate_3m(minute_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "delta_notional": sum(float(r.get("delta_notional") or 0.0) for r in rs),
             "total_qty": total_qty,
             "delta_ratio": delta_qty / total_qty if total_qty else None,
+            "book_imbalance_1_mean": _mean([r.get("book_imbalance_1_mean") for r in rs]),
+            "book_imbalance_5_mean": _mean([r.get("book_imbalance_5_mean") for r in rs]),
+            "book_imbalance_10_mean": _mean([r.get("book_imbalance_10_mean") for r in rs]),
+            "book_imbalance_20_mean": _mean([r.get("book_imbalance_20_mean") for r in rs]),
+            "spread_bps_mean": _mean([r.get("spread_bps_mean") for r in rs]),
+            "microprice_mean": _mean([r.get("microprice_mean") for r in rs]),
             "depth_update_events": sum(int(r.get("depth_update_events") or 0) for r in rs),
             "depth_snapshot_events": sum(int(r.get("depth_snapshot_events") or 0) for r in rs),
-            "book_features_status": "UNCERTIFIED",
-            "source_schema": "research_batch_v3",
+            "book_valid_seconds": sum(int(r.get("book_valid_seconds") or 0) for r in rs),
+            "book_features_status": BOOK_STATUS,
+            "source_schema": "research_batch_v4",
             "complete_minutes": 3,
         })
     return out
@@ -331,7 +508,7 @@ def main() -> int:
     bars3 = aggregate_3m(mins)
     write_csv_gz(bars3, batch / "features_3m.csv.gz")
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "rows_1s": len(rows),
         "rows_1m": len(mins),
         "rows_3m": len(bars3),
@@ -339,9 +516,13 @@ def main() -> int:
         "windows_seconds": list(WINDOWS),
         "forward_labels": list(FORWARD_HORIZONS),
         "long_horizon_labels_seconds": [300, 600, 900, 1800],
-        "book_features_status": "UNCERTIFIED",
+        "book_features_status": BOOK_STATUS,
+        "book_features": [
+            "best_bid", "best_ask", "mid_price", "spread_abs", "spread_bps", "microprice",
+            "book_bid_qty_1/5/10/20", "book_ask_qty_1/5/10/20", "book_imbalance_1/5/10/20",
+        ],
+        "book_reconstruction": "Absolute price-level replacements from validated depth updates, re-anchored at snapshots and invalidated across version discontinuities.",
         "bars_3m_definition": "UTC-aligned aggregation of three complete 1m buckets derived from live raw trades/features; incomplete boundary buckets excluded.",
-        "note": "Depth imbalance/microprice/pressure remain disabled until independent depth-semantics validation passes.",
     }
     (batch / "research_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

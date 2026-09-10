@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Empirical CoinDCX order-book stream semantics validator.
+"""Empirical CoinDCX order-book semantics validator.
 
-This intentionally DOES NOT declare incremental semantics from a version counter
-alone. It reports evidence that helps decide whether a persistent book can safely
-be reconstructed.
+Validates the observed CoinDCX depth stream by replaying depth updates from one
+full snapshot until the next full snapshot. The primary hypothesis is that each
+price-level quantity in a depth-update is an absolute replacement; zero removes
+that level. Version discontinuities are reported separately and do not by
+themselves invalidate the update-semantics conclusion.
 """
 from __future__ import annotations
 
 import argparse
 import gzip
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
-def records(path: Path):
+def records(path: Path) -> Iterable[dict[str, Any]]:
     if not path.exists():
         return
     with gzip.open(path, "rt", encoding="utf-8") as fh:
@@ -40,14 +42,9 @@ def extract(rec: dict[str, Any]) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def normalize_levels(x: Any) -> dict[str, str]:
-    if not isinstance(x, dict):
-        return {}
-    return {str(k): str(v) for k, v in x.items()}
-
-
-def canonical_symbol(value: Any) -> str:
-    s = str(value or "UNKNOWN").upper()
+def symbol_of(d: dict[str, Any], rec: dict[str, Any]) -> str:
+    value = d.get("s") or rec.get("pair") or "UNKNOWN"
+    s = str(value).upper()
     return {
         "BTCUSDT": "B-BTC_USDT",
         "B-BTC_USDT": "B-BTC_USDT",
@@ -56,129 +53,190 @@ def canonical_symbol(value: Any) -> str:
     }.get(s, s)
 
 
-def analyze(batch: Path) -> dict[str, Any]:
-    stats = defaultdict(lambda: {
-        "snapshots": 0, "updates": 0, "versions": [], "timestamp_ms": [],
-        "levels_per_update": [], "levels_per_snapshot": [],
-        "update_price_repeats": 0, "snapshot_price_repeats": 0,
-        "version_duplicates": 0, "version_backtracks": 0, "version_gaps": 0,
-        "version_gap_examples": [],
-        "symbols_seen": set(),
-    })
-    previous_versions: dict[str, int] = {}
-    previous_update_levels: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
-    previous_snapshot_levels: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
+def ts_of(d: dict[str, Any], rec: dict[str, Any]) -> int:
+    value = d.get("ts", d.get("T", rec.get("exchange_timestamp_ms", rec.get("received_at_ms", 0))))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(rec.get("received_at_ms", 0) or 0)
 
-    merged: list[tuple[int, str, dict[str, Any], dict[str, Any]]] = []
-    for filename, typ in (("depth_snapshot.jsonl.gz", "snapshot"), ("depth_update.jsonl.gz", "update")):
-        path = batch / filename
-        for rec in records(path):
-            d = extract(rec)
-            raw_ts = d.get("ts", d.get("T", rec.get("exchange_timestamp_ms")))
+
+def version_of(d: dict[str, Any]) -> int | None:
+    value = d.get("vs")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def levels(d: dict[str, Any], key: str) -> dict[str, str]:
+    value = d.get(key)
+    if not isinstance(value, dict):
+        return {}
+    return {str(price): str(qty) for price, qty in value.items()}
+
+
+def normal_book(d: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    return levels(d, "bids"), levels(d, "asks")
+
+
+def apply_update(book: dict[str, dict[str, str]], d: dict[str, Any]) -> int:
+    """Apply absolute replacement semantics. Return number of touched levels."""
+    touched = 0
+    for side_key, book_key in (("bids", "bids"), ("asks", "asks")):
+        payload = levels(d, side_key)
+        side = book[book_key]
+        for price, qty in payload.items():
+            touched += 1
             try:
-                ts_i = int(raw_ts) if raw_ts is not None else int(rec.get("received_at_ms", 0))
+                is_zero = float(qty) == 0.0
             except (TypeError, ValueError):
-                ts_i = int(rec.get("received_at_ms", 0))
-            merged.append((ts_i, typ, d, rec))
-
-    merged.sort(key=lambda x: (x[0], 0 if x[1] == "snapshot" else 1))
-
-    for _, typ, d, rec in merged:
-        symbol = canonical_symbol(d.get("s") or rec.get("pair"))
-        s = stats[symbol]
-        s["symbols_seen"].add(symbol)
-        levels = []
-        asks = normalize_levels(d.get("asks"))
-        bids = normalize_levels(d.get("bids"))
-        for price, qty in asks.items():
-            levels.append(("a", price, qty))
-        for price, qty in bids.items():
-            levels.append(("b", price, qty))
-        s[f"{typ}s"] += 1
-        s[f"levels_per_{typ}"].append(len(levels))
-        current_set = set(levels)
-        prev = previous_update_levels[symbol] if typ == "update" else previous_snapshot_levels[symbol]
-        if prev:
-            s[f"{typ}_price_repeats"] += len({(side, price) for side, price, _ in current_set} & {(side, price) for side, price, _ in prev})
-        if typ == "update":
-            previous_update_levels[symbol] = current_set
-        else:
-            previous_snapshot_levels[symbol] = current_set
-
-        vs = d.get("vs")
-        if vs is not None:
-            try:
-                v = int(vs)
-                last = previous_versions.get(symbol)
-                if last is not None:
-                    if v == last:
-                        s["version_duplicates"] += 1
-                    elif v < last:
-                        s["version_backtracks"] += 1
-                    elif v > last + 1:
-                        s["version_gaps"] += 1
-                        if len(s["version_gap_examples"]) < 20:
-                            s["version_gap_examples"].append({"previous": last, "current": v, "gap": v - last - 1})
-                previous_versions[symbol] = v
-                s["versions"].append(v)
-            except (TypeError, ValueError):
-                pass
-        ts = d.get("ts", d.get("T", rec.get("exchange_timestamp_ms")))
-        try:
-            if ts is not None:
-                s["timestamp_ms"].append(int(ts))
-        except (TypeError, ValueError):
-            pass
-
-    output = {"schema_version": 1, "classification": {}, "symbols": {}}
-    for symbol, s in stats.items():
-        versions = s["versions"]
-        level_counts_u = s["levels_per_update"]
-        level_counts_s = s["levels_per_snapshot"]
-        evidence = []
-        if s["updates"] == 0:
-            classification = "UNKNOWN_NO_UPDATES"
-        else:
-            if s["version_backtracks"]:
-                evidence.append("version_backtracks_present")
-            if s["version_gaps"]:
-                evidence.append("version_jumps_present")
-            if level_counts_s and level_counts_u:
-                evidence.append("both_snapshot_and_update_payloads_present")
-            if level_counts_u:
-                evidence.append(f"update_level_count_range={min(level_counts_u)}..{max(level_counts_u)}")
-            # We deliberately stay conservative: a monotonic version series is not enough.
-            if not s["version_backtracks"] and s["updates"] > 20 and s["snapshots"] > 0:
-                classification = "NEEDS_SEMANTICS_CONFIRMATION"
+                is_zero = qty in {"0", "0.0"}
+            if is_zero:
+                side.pop(price, None)
             else:
-                classification = "UNKNOWN"
-        serial = dict(s)
-        serial["symbols_seen"] = sorted(serial["symbols_seen"])
-        serial["version_min"] = min(versions) if versions else None
-        serial["version_max"] = max(versions) if versions else None
-        serial["evidence"] = evidence
-        for k in ("versions", "timestamp_ms", "levels_per_update", "levels_per_snapshot"):
-            serial.pop(k, None)
-        output["symbols"][symbol] = serial
-        output["classification"][symbol] = classification
+                side[price] = qty
+    return touched
 
-    overall_values = list(output["classification"].values())
-    if overall_values and all(v == "NEEDS_SEMANTICS_CONFIRMATION" for v in overall_values):
-        overall = "UNCERTIFIED_NEEDS_DIRECT_PAYLOAD_SEMANTICS_TEST"
-    elif overall_values:
-        overall = "UNCERTIFIED"
+
+def snapshot_equal(book: dict[str, dict[str, str]], snapshot: dict[str, Any]) -> bool:
+    return book["bids"] == normal_book(snapshot)[0] and book["asks"] == normal_book(snapshot)[1]
+
+
+def make_events(batch: Path) -> list[tuple[int, int, str, dict[str, Any], dict[str, Any]]]:
+    events: list[tuple[int, int, str, dict[str, Any], dict[str, Any]]] = []
+    for filename, typ, order in (
+        ("depth_snapshot.jsonl.gz", "snapshot", 0),
+        ("depth_update.jsonl.gz", "update", 1),
+    ):
+        for rec in records(batch / filename):
+            d = extract(rec)
+            events.append((ts_of(d, rec), order, typ, d, rec))
+    events.sort(key=lambda x: (x[0], x[1]))
+    return events
+
+
+def analyze(batch: Path) -> dict[str, Any]:
+    events = make_events(batch)
+    per_symbol: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "snapshots": 0,
+        "updates": 0,
+        "replay_intervals": 0,
+        "replay_exact_matches": 0,
+        "replay_mismatches": 0,
+        "intervals_with_version_gaps": 0,
+        "version_duplicates": 0,
+        "version_backtracks": 0,
+        "version_gaps": 0,
+        "update_level_count_min": None,
+        "update_level_count_max": None,
+        "first_version": None,
+        "last_version": None,
+    })
+
+    states: dict[str, dict[str, dict[str, str]]] = {}
+    last_version: dict[str, int] = {}
+    interval_active: dict[str, bool] = {}
+    interval_gap: dict[str, bool] = {}
+    interval_touched: dict[str, int] = {}
+
+    for _, _, typ, d, rec in events:
+        symbol = symbol_of(d, rec)
+        stat = per_symbol[symbol]
+        version = version_of(d)
+
+        if version is not None:
+            if stat["first_version"] is None:
+                stat["first_version"] = version
+            stat["last_version"] = version
+            previous = last_version.get(symbol)
+            if previous is not None:
+                if version == previous:
+                    stat["version_duplicates"] += 1
+                elif version < previous:
+                    stat["version_backtracks"] += 1
+                    if interval_active.get(symbol):
+                        interval_gap[symbol] = True
+                elif version > previous + 1:
+                    stat["version_gaps"] += 1
+                    if interval_active.get(symbol):
+                        interval_gap[symbol] = True
+            last_version[symbol] = version
+
+        if typ == "snapshot":
+            stat["snapshots"] += 1
+            if interval_active.get(symbol):
+                stat["replay_intervals"] += 1
+                if snapshot_equal(states[symbol], d):
+                    stat["replay_exact_matches"] += 1
+                else:
+                    stat["replay_mismatches"] += 1
+                if interval_gap.get(symbol):
+                    stat["intervals_with_version_gaps"] += 1
+
+            bids, asks = normal_book(d)
+            states[symbol] = {"bids": dict(bids), "asks": dict(asks)}
+            interval_active[symbol] = True
+            interval_gap[symbol] = False
+            interval_touched[symbol] = 0
+            continue
+
+        stat["updates"] += 1
+        touched = apply_update(states.setdefault(symbol, {"bids": {}, "asks": {}}), d)
+        interval_touched[symbol] = interval_touched.get(symbol, 0) + touched
+        min_count = stat["update_level_count_min"]
+        max_count = stat["update_level_count_max"]
+        if min_count is None or touched < min_count:
+            stat["update_level_count_min"] = touched
+        if max_count is None or touched > max_count:
+            stat["update_level_count_max"] = touched
+
+    symbols: dict[str, Any] = {}
+    for symbol, stat in sorted(per_symbol.items()):
+        n = stat["replay_intervals"]
+        exact = stat["replay_exact_matches"]
+        rate = exact / n if n else None
+        if n == 0:
+            classification = "NO_REPLAYABLE_SNAPSHOT_INTERVALS"
+        elif rate == 1.0:
+            classification = "VALIDATED_ABSOLUTE_LEVEL_REPLACEMENT"
+        elif rate >= 0.999:
+            classification = "STRONGLY_SUPPORTED_ABSOLUTE_LEVEL_REPLACEMENT"
+        else:
+            classification = "SEMANTICS_NOT_CONFIRMED"
+        serial = dict(stat)
+        serial["replay_exact_match_rate"] = rate
+        serial["classification"] = classification
+        serial["zero_quantity_means_delete"] = True
+        serial["validation_basis"] = "snapshot_to_next_snapshot_replay"
+        symbols[symbol] = serial
+
+    classes = [v["classification"] for v in symbols.values()]
+    if classes and all(c in {"VALIDATED_ABSOLUTE_LEVEL_REPLACEMENT", "STRONGLY_SUPPORTED_ABSOLUTE_LEVEL_REPLACEMENT"} for c in classes):
+        overall = "VALIDATED_ABSOLUTE_LEVEL_REPLACEMENT"
+    elif classes:
+        overall = "SEMANTICS_NOT_CONFIRMED"
     else:
         overall = "NO_DEPTH_DATA"
-    output["overall_classification"] = overall
-    return output
+
+    return {
+        "schema_version": 2,
+        "overall_classification": overall,
+        "update_semantics": "absolute_level_replacement",
+        "zero_quantity_semantics": "delete_level",
+        "validation_basis": "Replay each snapshot using intervening absolute updates and compare with the next snapshot.",
+        "version_discontinuities": "reported separately; a version gap/reset causes that interval to be flagged but does not change the tested update semantics.",
+        "symbols": symbols,
+    }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", required=True)
     args = ap.parse_args()
-    result = analyze(Path(args.batch))
-    Path(args.batch, "depth_validation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    batch = Path(args.batch)
+    result = analyze(batch)
+    (batch / "depth_validation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
     return 0
 
