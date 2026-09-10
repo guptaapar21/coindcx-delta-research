@@ -12,7 +12,20 @@
         "pair": "B-ETH_USDT"
       }
     ],
-    "orderbook_depth": 50
+    "orderbook_depth": 50,
+    "futures_socket_url": "https://stream.coindcx.com",
+    "futures_symbols": [
+      {
+        "name": "BTC/USDT",
+        "pair": "B-BTC_USDT"
+      },
+      {
+        "name": "ETH/USDT",
+        "pair": "B-ETH_USDT"
+      }
+    ],
+    "futures_current_prices": true,
+    "futures_enabled": true
   },
   "collector": {
     "default_duration_minutes": 230,
