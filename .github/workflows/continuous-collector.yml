@@ -1,6 +1,14 @@
 name: AdvisorX CoinDCX continuous collector
 
 on:
+  # Temporary trigger for the one post-fix full-length validation run.
+  # It ignores collector-generated data commits, preventing a trigger loop.
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'data/**'
+
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -57,7 +65,7 @@ jobs:
         id: duration
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "repository_dispatch" ] || [ "${{ github.event_name }}" = "push" ]; then
             echo "minutes=230" >> "$GITHUB_OUTPUT"
           else
             echo "minutes=${{ inputs.duration_minutes || '30' }}" >> "$GITHUB_OUTPUT"
@@ -71,8 +79,15 @@ jobs:
             --duration-minutes "${{ steps.duration.outputs.minutes }}" \
             --out "runtime/${{ steps.batch.outputs.batch_id }}"
 
+      - name: Mark raw collection complete
+        id: raw_complete
+        if: success()
+        shell: bash
+        run: |
+          echo "complete=true" >> "$GITHUB_OUTPUT"
+
       - name: Build research features
-        if: always()
+        if: success()
         run: |
           python src/research_batch.py \
             --batch "runtime/${{ steps.batch.outputs.batch_id }}"
@@ -81,7 +96,7 @@ jobs:
             --batch "runtime/${{ steps.batch.outputs.batch_id }}"
 
       - name: Merge compact research history
-        if: always()
+        if: success()
         run: |
           if test -f "runtime/${{ steps.batch.outputs.batch_id }}/features_1m.csv.gz"; then
             python tools/merge_compact.py \
@@ -91,7 +106,7 @@ jobs:
           fi
 
       - name: Commit compact research state
-        if: always()
+        if: success()
         shell: bash
         run: |
           git config user.name "advisorx-bot"
@@ -134,7 +149,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Trigger next production batch
-        if: ${{ success() && (github.event_name == 'repository_dispatch' || inputs.continue_chain == true) }}
+        if: ${{ always() && steps.raw_complete.outputs.complete == 'true' && (github.event_name == 'repository_dispatch' || inputs.continue_chain == true) }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

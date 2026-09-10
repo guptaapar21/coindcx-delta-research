@@ -13,13 +13,18 @@ def write_trade_file(batch: Path, rows: list[dict]):
             f.write(json.dumps(r) + '\n')
 
 
+def write_futures_trade_file(batch: Path, rows: list[dict]):
+    with gzip.open(batch / 'futures_trades.jsonl.gz', 'wt', encoding='utf-8') as f:
+        for r in rows:
+            f.write(json.dumps(r) + '\n')
+
+
 def test_trade_sign_and_delta(tmp_path):
     batch = tmp_path / 'b'; batch.mkdir()
-    rows = [
+    write_trade_file(batch, [
         {"raw": {"data": {"s": "B-BTC_USDT", "T": 1000, "p": "100", "q": "2", "m": 0}}},
         {"raw": {"data": {"s": "B-BTC_USDT", "T": 2000, "p": "101", "q": "1", "m": 1}}},
-    ]
-    write_trade_file(batch, rows)
+    ])
     out = research_batch.build_seconds(batch)
     assert len(out) == 2
     assert sum(x['delta_qty'] for x in out) == 1
@@ -97,12 +102,6 @@ def test_long_forward_labels_are_added_without_expanding_flow_windows(tmp_path):
     assert abs(r0['forward_return_1800s'] - 18.0) < 1e-12
 
 
-def write_futures_trade_file(batch: Path, rows: list[dict]):
-    with gzip.open(batch / 'futures_trades.jsonl.gz', 'wt', encoding='utf-8') as f:
-        for r in rows:
-            f.write(json.dumps(r) + '\n')
-
-
 def test_futures_delta_is_captured_separately_and_aligned(tmp_path):
     batch = tmp_path / 'b'; batch.mkdir()
     write_trade_file(batch, [
@@ -136,3 +135,43 @@ def test_exploratory_futures_symbol_is_kept_separate_from_spot(tmp_path):
     assert out[0]['symbol'] == 'B-SUI_USDT'
     assert out[0]['futures_trade_count'] == 1
     assert out[0]['futures_delta_qty'] == 7.0
+
+
+def test_rolling_window_math_is_gap_safe():
+    epochs = [0, 1, 3, 7, 8, 15]
+    values = [1, 2, 3, 4, 5, 6]
+    for w in research_batch.WINDOWS:
+        got = research_batch._window_sums(values, epochs, w)
+        expected = []
+        for i, sec in enumerate(epochs):
+            cutoff = sec - w + 1
+            j = i
+            while j >= 0 and epochs[j] >= cutoff:
+                j -= 1
+            expected.append(sum(values[j + 1:i + 1]))
+        assert got == expected
+
+
+def test_spot_depth_gap_invalidates_until_new_snapshot(tmp_path):
+    batch = tmp_path / 'b'; batch.mkdir()
+    with gzip.open(batch / 'depth_snapshot.jsonl.gz', 'wt', encoding='utf-8') as f:
+        for rec in [
+            {"raw": {"data": {"s": "B-BTC_USDT", "ts": 1000, "vs": 1,
+                               "bids": {"100": "2"}, "asks": {"101": "3"}}}},
+            {"raw": {"data": {"s": "B-BTC_USDT", "ts": 4000, "vs": 4,
+                               "bids": {"102": "2"}, "asks": {"103": "3"}}}},
+        ]:
+            f.write(json.dumps(rec) + '\n')
+    with gzip.open(batch / 'depth_update.jsonl.gz', 'wt', encoding='utf-8') as f:
+        for rec in [
+            {"raw": {"data": {"s": "B-BTC_USDT", "ts": 2000, "vs": 2,
+                               "bids": {"100": "1"}, "asks": {}}}},
+            {"raw": {"data": {"s": "B-BTC_USDT", "ts": 3000, "vs": 99,
+                               "bids": {"99": "1"}, "asks": {}}}},
+        ]:
+            f.write(json.dumps(rec) + '\n')
+    got = research_batch._load_depth_seconds(batch)
+    assert got[('B-BTC_USDT', 1)]['book_valid'] is True
+    assert got[('B-BTC_USDT', 2)]['book_valid'] is True
+    assert got[('B-BTC_USDT', 3)]['book_valid'] is False
+    assert got[('B-BTC_USDT', 4)]['book_valid'] is True
