@@ -4,15 +4,18 @@ This package is the production-oriented next stage for the CoinDCX Delta/order-f
 
 ## Scope locked for this version
 
-- Markets: **BTC/USDT + ETH/USDT only**.
-- Live websocket streams: raw `new-trade`, `depth-update`, `depth-snapshot`, `price-change`.
+- Markets: **BTC/USDT + ETH/USDT controls**, plus **SOL/USDT, SUI/USDT, XRP/USDT and DOGE/USDT exploratory markets**. The universe is intentionally small and frozen in `config.json` so comparisons remain auditable rather than drifting every batch.
+- Live Spot websocket streams: raw `new-trade`, `depth-update`, `depth-snapshot`, `price-change`.
+- Live Futures websocket streams: `new-trade`, `price-change`, `currentPrices@futures#update`, plus per-instrument `depth-snapshot` orderbooks.
+- Spot and Futures use **separate Socket.IO connections** because CoinDCX documents separate Spot and Futures websocket endpoints.
 - No live 15m/1h/1d candle streams.
 - Our own 1m/3m research bars are derived from the live raw trades/features. The 3m layer is built from three complete UTC-aligned 1m buckets; incomplete boundary buckets are excluded.
 - Short order-flow windows: 5s, 15s, 30s, 60s, 180s.
 - Microstructure forward labels: +5s, +15s, +30s, +60s, +180s.
 - Longer response labels: +5m, +10m, +15m, +30m; these are labels only, not additional rolling-flow windows.
 - MFE/MAE hooks can be added after the first stable feature pass.
-- Depth-derived imbalance/microprice/pressure are **disabled as trusted features** until the empirical depth validator provides enough evidence to justify reconstruction.
+- Spot depth-derived imbalance/microprice features use the empirically validated absolute-update + version-gap guard. Futures orderbooks are snapshot-only in the research layer and are not reconstructed as incremental books.
+- Futures Open Interest is **not** synthesized or inferred from public fields.
 
 ## Why depth is treated conservatively
 
@@ -60,6 +63,12 @@ python tools/sync_archives.py --repo guptaapar21/coindcx-delta-research --dest .
 ```
 
 Schedule that command using the operating system scheduler. Because release assets are public downloads, the script does not require a token for a public repository.
+
+## Cross-market research layer
+
+Each exploratory market is collected on both Spot and Futures. The compact research layer keeps Spot Delta, Futures Delta, Spot orderbook state and Futures orderbook state separate so we can test lead/lag and divergence without changing the original definitions. It also records Futures orderbook changes between snapshots (top-level quantity/imbalance changes, spread change and microprice return).
+
+The first priority is evidence, not a pre-selected signal: Futures Delta -> future price, Futures vs Spot Delta divergence, Futures/Spot price basis, Delta + orderbook reaction, and volatility-normalized effects. BTC/ETH remain controls while SOL/SUI/XRP/DOGE provide higher-volatility test cases.
 
 ## Research horizon layers
 
