@@ -4,6 +4,6 @@
     "2026-09"
   ],
   "epoch_key": "minute_epoch",
-  "generated_utc": "2026-09-09T21:11:43.003774+00:00",
+  "generated_utc": "2026-09-10T01:02:16.851210+00:00",
   "note": "Compact history is retained as long-lived research data; raw websocket data lives in Actions artifacts/release archives."
 }
