@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""CoinDCX BTC/USDT + ETH/USDT live raw market-data collector.
+"""CoinDCX multi-market live raw market-data collector.
 
 Design goals:
 - Capture raw websocket payloads first; do not make unverified depth assumptions.
 - Keep exchange timestamp and local receive timestamp.
-- Capture spot trades, depth-update, depth-snapshot and price-change.
-- Capture public futures trades and price-change for BTC/USDT + ETH/USDT.
-- Capture only the BTC/USDT + ETH/USDT slice from the public futures
-  current-prices stream to avoid storing the entire multi-asset futures feed.
+- Capture configured Spot trades, depth-update, depth-snapshot and price-change.
+- Capture configured public Futures trades, price-change, current-prices and
+  per-instrument orderbook depth snapshots.
+- Keep the configured universe small and frozen in config.json for auditable
+  BTC/ETH controls plus exploratory higher-volatility markets.
 - No 15m/1h/1d live candle streams are joined.
 - Each run is an independent batch with an auditable manifest.
 """
@@ -104,6 +105,7 @@ class Collector:
         "new-trade": "futures_trades.jsonl.gz",
         "price-change": "futures_price_change.jsonl.gz",
         "current-prices": "futures_current_prices.jsonl.gz",
+        "depth-snapshot": "futures_depth_snapshot.jsonl.gz",
     }
 
     def __init__(self, cfg: dict[str, Any], out_dir: Path, duration_minutes: float) -> None:
@@ -129,6 +131,7 @@ class Collector:
         self.join_channels: list[str] = []
         self.futures_join_channels: list[str] = []
         self.futures_pairs: set[str] = set()
+        self.futures_book_sockets: dict[str, socketio.Client] = {}
         self.join_emissions = 0
         self.futures_join_emissions = 0
         self.reconnect_count = 0
@@ -314,6 +317,80 @@ class Collector:
             if event not in {"new-trade", "price-change", "currentPrices@futures#update", "currentPrices@futures#snapshot", "connect", "disconnect", "connect_error"}:
                 self.unknown_events[f"futures:{event}"] += 1
 
+    def _start_futures_book_sockets(self) -> int:
+        if not self.futures_pairs:
+            return 0
+        url = self.cfg["coindcx"].get("futures_socket_url")
+        if not url:
+            self._record_error("futures:book_socket_config", "futures_socket_url is required for futures orderbook capture")
+            return 0
+        depth = int(self.cfg["coindcx"].get("futures_orderbook_depth", 50))
+        started = 0
+        socket_kwargs = {
+            "reconnection": bool(self.cfg["collector"].get("reconnect", True)),
+            "reconnection_attempts": int(self.cfg["collector"].get("max_reconnect_attempts", 12)),
+            "logger": False,
+            "engineio_logger": False,
+        }
+        for pair in sorted(self.futures_pairs):
+            sio = socketio.Client(**socket_kwargs)
+
+            @sio.event
+            def connect(sio=sio, pair=pair):
+                self.connection_events.append({"time_utc": utc_iso(), "market": "futures_orderbook", "pair": pair, "state": "connected"})
+                channel = f"{pair}@orderbook@{depth}-futures"
+                try:
+                    sio.emit("join", {"channelName": channel})
+                    self.futures_join_emissions += 1
+                except Exception as exc:
+                    self._record_error(f"futures:book_join:{pair}", exc)
+
+            @sio.event
+            def disconnect(pair=pair):
+                self.connection_events.append({"time_utc": utc_iso(), "market": "futures_orderbook", "pair": pair, "state": "disconnected"})
+
+            @sio.on("depth-snapshot")
+            def on_depth_snapshot(response, pair=pair):
+                payload = self._payload("depth-snapshot", response)
+                data = self._extract_data(payload)
+                if str(data.get("pr", "")).lower() not in {"f", "futures"}:
+                    return
+                received_ms = utc_now_ms()
+                record = {
+                    "received_at_utc": datetime.fromtimestamp(received_ms / 1000, tz=timezone.utc).isoformat(),
+                    "received_at_ms": received_ms,
+                    "received_at_ns": time.time_ns(),
+                    "event": "depth-snapshot",
+                    "market": "futures",
+                    "exchange_timestamp_ms": data.get("ts", data.get("T")),
+                    "pair": data.get("s") or pair,
+                    "raw": payload,
+                }
+                self._writer_for("depth-snapshot", futures=True).write(record)
+                self.futures_event_counts["depth-snapshot"] += 1
+                self.last_event_monotonic = time.monotonic()
+
+            self.futures_book_sockets[pair] = sio
+            try:
+                sio.connect(url, transports=["websocket"], wait_timeout=int(self.cfg["collector"].get("connect_timeout_seconds", 30)))
+                started += 1
+            except Exception as exc:
+                self._record_error(f"futures:book_socket_connect:{pair}", exc)
+                try:
+                    sio.disconnect()
+                except Exception:
+                    pass
+        return started
+
+    def _stop_futures_book_sockets(self) -> None:
+        for pair, sio in self.futures_book_sockets.items():
+            try:
+                if sio.connected:
+                    sio.disconnect()
+            except Exception as exc:
+                self._record_error(f"futures:book_socket_disconnect:{pair}", exc)
+        self.futures_book_sockets.clear()
+
     def stop(self, *_args: Any) -> None:
         self.stop_event.set()
 
@@ -372,6 +449,7 @@ class Collector:
                         wait_timeout=int(self.cfg["collector"].get("connect_timeout_seconds", 30)),
                     )
                     futures_connected = True
+                    book_started = self._start_futures_book_sockets()
                 except Exception as exc:
                     self._record_error("futures:socket_connect", exc)
 
@@ -400,6 +478,7 @@ class Collector:
             except Exception as exc:
                 self._record_error("spot:socket_disconnect", exc)
         if futures_connected:
+            self._stop_futures_book_sockets()
             try:
                 self.futures_sio.disconnect()
             except Exception as exc:
@@ -419,7 +498,8 @@ class Collector:
             "requested_duration_seconds": self.duration_seconds,
             "symbols": pairs,
             "streams": ["new-trade", "depth-update", "depth-snapshot", "price-change"],
-            "futures_streams": ["new-trade", "price-change", "current-prices"] if futures_enabled else [],
+            "futures_streams": ["new-trade", "price-change", "current-prices", "depth-snapshot"] if futures_enabled else [],
+            "futures_orderbook_channel_depth": int(self.cfg["coindcx"].get("futures_orderbook_depth", 50)),
             "orderbook_channel_depth": depth,
             "socket_url": self.cfg["coindcx"]["socket_url"],
             "futures_socket_url": self.cfg["coindcx"].get("futures_socket_url"),
@@ -437,13 +517,14 @@ class Collector:
             "errors": self.errors,
             "notes": [
                 "Raw depth payloads are preserved without assuming incremental semantics.",
-                "Public futures trades/price changes are captured separately; futures current-prices are filtered to configured BTC/USDT + ETH/USDT pairs.",
+                "Public futures trades/price changes are captured separately; futures current-prices are filtered to configured futures pairs.",
+                "Futures orderbooks are captured as per-instrument depth snapshots on dedicated futures socket connections so the pair identity is not inferred from a multiplexed payload.",
                 "Futures OI is not assumed or synthesized; only fields actually present in public payloads are preserved.",
                 "Depth-derived imbalance/microprice features remain uncertified until depth semantics validation passes.",
             ],
         }
         (self.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        futures_required = ["new-trade", "price-change", "current-prices"] if futures_enabled else []
+        futures_required = ["new-trade", "price-change", "current-prices", "depth-snapshot"] if futures_enabled else []
         futures_missing = [k for k in futures_required if self.futures_event_counts.get(k, 0) == 0]
         quality = {
             "status": "PASS" if not self.errors else "PASS_WITH_ERRORS",
