@@ -65,7 +65,6 @@ def test_string_encoded_raw_data_is_parsed(tmp_path):
     assert out[0]['aggressive_buy_qty'] == 1.5
 
 
-
 def test_actual_collector_string_payload_and_symbol_normalization(tmp_path):
     batch = tmp_path / 'b'; batch.mkdir()
     rec = {
@@ -96,3 +95,44 @@ def test_long_forward_labels_are_added_without_expanding_flow_windows(tmp_path):
     assert abs(r0['forward_return_5s'] - 0.05) < 1e-12
     assert abs(r0['forward_return_300s'] - 3.0) < 1e-12
     assert abs(r0['forward_return_1800s'] - 18.0) < 1e-12
+
+
+def write_futures_trade_file(batch: Path, rows: list[dict]):
+    with gzip.open(batch / 'futures_trades.jsonl.gz', 'wt', encoding='utf-8') as f:
+        for r in rows:
+            f.write(json.dumps(r) + '\n')
+
+
+def test_futures_delta_is_captured_separately_and_aligned(tmp_path):
+    batch = tmp_path / 'b'; batch.mkdir()
+    write_trade_file(batch, [
+        {"raw": {"data": {"s": "B-BTC_USDT", "T": 1000, "p": "100", "q": "2", "m": 0}}},
+        {"raw": {"data": {"s": "B-BTC_USDT", "T": 2000, "p": "101", "q": "1", "m": 1}}},
+    ])
+    write_futures_trade_file(batch, [
+        {"raw": {"data": json.dumps({"s": "B-BTC_USDT", "T": 1000, "p": "100.2", "q": "3", "m": 0, "pr": "f"})}},
+        {"raw": {"data": json.dumps({"s": "B-BTC_USDT", "T": 2000, "p": "100.1", "q": "1", "m": 1, "pr": "f"})}},
+    ])
+    out = research_batch.build_seconds(batch)
+    assert out[0]['futures_aggressive_buy_qty'] == 3
+    assert out[1]['futures_aggressive_sell_qty'] == 1
+    assert out[0]['futures_delta_qty'] == 3
+    assert out[1]['futures_delta_qty'] == -1
+    assert out[0]['futures_delta_ratio_5s'] == 1.0
+    assert out[1]['futures_delta_ratio_5s'] == 0.5
+    assert out[1]['futures_spot_delta_divergence_5s'] is not None
+
+
+def test_exploratory_futures_symbol_is_kept_separate_from_spot(tmp_path):
+    batch = tmp_path / 'b'; batch.mkdir()
+    write_trade_file(batch, [
+        {"raw": {"data": {"s": "B-SUI_USDT", "T": 1000, "p": "3.00", "q": "5", "m": 0}}},
+    ])
+    write_futures_trade_file(batch, [
+        {"raw": {"data": json.dumps({"s": "B-SUI_USDT", "T": 1000, "p": "3.01", "q": "7", "m": 0, "pr": "f"})}},
+    ])
+    out = research_batch.build_seconds(batch)
+    assert len(out) == 1
+    assert out[0]['symbol'] == 'B-SUI_USDT'
+    assert out[0]['futures_trade_count'] == 1
+    assert out[0]['futures_delta_qty'] == 7.0
