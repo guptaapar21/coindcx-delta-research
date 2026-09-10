@@ -20,3 +20,25 @@ The self-chain uses `repository_dispatch`, which GitHub documents as an event th
 ## Longer-horizon research labels
 
 The current flow-window definitions remain 5/15/30/60/180 seconds. Longer horizons are represented as forward-response labels at 5/10/15/30 minutes rather than expanding the rolling-flow feature set. The compact merge step recalculates those labels from the full accumulated compact history to preserve future bars that fall in the next collector batch.
+
+
+## Futures capture design (additive)
+
+Spot and Futures use separate Socket.IO connections because CoinDCX documents
+different Futures and Spot stream endpoints. The main Futures socket captures
+`new-trade`, `price-change` and the configured slice of `currentPrices@futures@rt`.
+Futures trade/price payloads are accepted only when the payload product marker
+identifies Futures (`pr=f`/`futures`).
+
+Futures orderbooks use the documented `{instrument}@orderbook@50-futures`
+channel and `depth-snapshot` event. The collector uses one dedicated Futures
+orderbook Socket.IO connection per configured instrument so each snapshot has
+a deterministic symbol attribution even when a multiplexed payload does not
+carry a reliable symbol field. The raw snapshots are preserved in
+`futures_depth_snapshot.jsonl.gz`; research features are computed directly from
+the full snapshots rather than treating them as incremental deltas.
+
+The configured universe is frozen in `config.json`: BTC/ETH are controls and
+SOL/SUI/XRP/DOGE are exploratory higher-volatility markets. Futures capture is
+intentionally an additive research input. The production Spot definitions are
+unchanged, and absence of public Open Interest is not filled with a proxy.
