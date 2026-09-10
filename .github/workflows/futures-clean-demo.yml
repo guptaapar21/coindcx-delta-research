@@ -1,0 +1,29 @@
+name: AdvisorX CoinDCX Futures Clean OI Discovery
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  futures-clean-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install "python-socketio[client]>=5.11,<6" requests
+
+      - name: Run clean futures discovery
+        run: python tools/futures_clean_demo.py --minutes 5 --out futures_clean_demo_output
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coindcx-futures-clean-demo-${{ github.run_id }}
+          path: futures_clean_demo_output/
+          retention-days: 7
