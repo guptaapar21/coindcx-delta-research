@@ -3,6 +3,7 @@
 
 Layers:
 - 1-second trade-flow observations with rolling 5/15/30/60/180s measurements
+- 1-second forward-response labels through +30 minutes
 - 1-minute bars/features
 - 3-minute bars/features derived from the same live 1-minute layer
 
@@ -22,6 +23,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 WINDOWS = (5, 15, 30, 60, 180)
+# Longer forward horizons are deliberately labels, not additional flow-window definitions.
+# This keeps the microstructure feature set stable while allowing us to measure how long
+# any observed edge persists.
+FORWARD_HORIZONS = (5, 15, 30, 60, 180, 300, 600, 900, 1800)
 
 
 def read_gz_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -203,7 +208,7 @@ def build_seconds(batch: Path) -> list[dict[str, Any]]:
         price_by_s = {x["epoch_second"]: x.get("last_price") for x in rs}
         for x in rs:
             p0 = safe_float(x.get("last_price"))
-            for w in WINDOWS:
+            for w in FORWARD_HORIZONS:
                 p1 = price_by_s.get(x["epoch_second"] + w)
                 x[f"forward_return_{w}s"] = p1 / p0 - 1.0 if p0 and p1 else None
     return final
@@ -260,7 +265,7 @@ def aggregate_1m(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "depth_update_events": sum(int(x.get("depth_update_events") or 0) for x in rs),
             "depth_snapshot_events": sum(int(x.get("depth_snapshot_events") or 0) for x in rs),
             "book_features_status": "UNCERTIFIED",
-            "source_schema": "research_batch_v2",
+            "source_schema": "research_batch_v3",
         })
     return out
 
@@ -308,7 +313,7 @@ def aggregate_3m(minute_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "depth_update_events": sum(int(r.get("depth_update_events") or 0) for r in rs),
             "depth_snapshot_events": sum(int(r.get("depth_snapshot_events") or 0) for r in rs),
             "book_features_status": "UNCERTIFIED",
-            "source_schema": "research_batch_v2",
+            "source_schema": "research_batch_v3",
             "complete_minutes": 3,
         })
     return out
@@ -332,7 +337,8 @@ def main() -> int:
         "rows_3m": len(bars3),
         "symbols": sorted({r["symbol"] for r in rows}),
         "windows_seconds": list(WINDOWS),
-        "forward_labels": [5, 15, 30, 60, 180],
+        "forward_labels": list(FORWARD_HORIZONS),
+        "long_horizon_labels_seconds": [300, 600, 900, 1800],
         "book_features_status": "UNCERTIFIED",
         "bars_3m_definition": "UTC-aligned aggregation of three complete 1m buckets derived from live raw trades/features; incomplete boundary buckets excluded.",
         "note": "Depth imbalance/microprice/pressure remain disabled until independent depth-semantics validation passes.",
