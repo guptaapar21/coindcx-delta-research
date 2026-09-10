@@ -1,0 +1,23 @@
+name: AdvisorX CoinDCX OI demo probe
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  oi-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install requests
+      - name: Probe CoinDCX futures OI-related endpoints
+        run: python tools/oi_demo.py --out oi_demo_output
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coindcx-oi-demo-${{ github.run_id }}
+          path: oi_demo_output/
+          retention-days: 7
