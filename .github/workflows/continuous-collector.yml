@@ -71,6 +71,7 @@ jobs:
         run: echo "complete=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload raw batch artifact
+        id: raw_upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -105,8 +106,10 @@ jobs:
           REPO: ${{ github.repository }}
           BATCH_ID: ${{ steps.batch.outputs.batch_id }}
           SOURCE_RUN_ID: ${{ github.run_id }}
+          ARTIFACT_ID: ${{ steps.raw_upload.outputs.artifact-id }}
         shell: bash
         run: |
+          test -n "$ARTIFACT_ID"
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
@@ -114,4 +117,5 @@ jobs:
             "/repos/${REPO}/dispatches" \
             -f event_type='coindcx-process-batch' \
             -f client_payload[batch_id]="${BATCH_ID}" \
-            -f client_payload[source_run_id]="${SOURCE_RUN_ID}"
+            -f client_payload[source_run_id]="${SOURCE_RUN_ID}" \
+            -f client_payload[artifact_id]="${ARTIFACT_ID}"
