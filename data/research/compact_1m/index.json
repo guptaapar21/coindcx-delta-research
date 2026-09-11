@@ -1,9 +1,17 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "months": [
     "2026-09"
   ],
   "epoch_key": "minute_epoch",
-  "generated_utc": "2026-09-10T04:52:54.892227+00:00",
-  "note": "Compact history is retained as long-lived research data; raw websocket data lives in Actions artifacts/release archives."
+  "forward_label_horizons_seconds": [
+    60,
+    180,
+    300,
+    600,
+    900,
+    1800
+  ],
+  "generated_utc": "2026-09-11T01:43:13.519443+00:00",
+  "note": "Compact history is retained as long-lived research data; raw websocket data lives in Actions artifacts/release archives. Longer forward-return labels are recalculated after merge so collector batch-boundary labels are not lost."
 }
