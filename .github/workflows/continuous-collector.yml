@@ -1,14 +1,6 @@
 name: AdvisorX CoinDCX continuous collector
 
 on:
-  # Temporary trigger for the one post-fix full-length validation run.
-  # It ignores collector-generated data commits, preventing a trigger loop.
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - 'data/**'
-
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -65,7 +57,7 @@ jobs:
         id: duration
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ] || [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "minutes=230" >> "$GITHUB_OUTPUT"
           else
             echo "minutes=${{ inputs.duration_minutes || '30' }}" >> "$GITHUB_OUTPUT"
