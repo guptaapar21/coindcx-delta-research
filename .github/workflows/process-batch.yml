@@ -1,0 +1,111 @@
+name: AdvisorX CoinDCX batch processing
+
+on:
+  repository_dispatch:
+    types:
+      - coindcx-process-batch
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: advisorx-coindcx-processing
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Download raw batch artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
+          BATCH_ID: ${{ github.event.client_payload.batch_id }}
+        shell: bash
+        run: |
+          test -n "$SOURCE_RUN_ID"
+          test -n "$BATCH_ID"
+          ARTIFACT_ID="$(gh api \
+            "/repos/${REPO}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == ("coindcx-raw-" + env.BATCH_ID)) | .id' | head -n1)"
+          test -n "$ARTIFACT_ID"
+          mkdir -p runtime
+          gh api \
+            "/repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > /tmp/raw.zip
+          unzip -q /tmp/raw.zip -d runtime
+          test -d "runtime/${BATCH_ID}"
+
+      - name: Build research features
+        env:
+          BATCH_ID: ${{ github.event.client_payload.batch_id }}
+        run: |
+          python src/research_batch.py --batch "runtime/${BATCH_ID}"
+          python tools/fix_futures_depth_symbols.py --batch "runtime/${BATCH_ID}"
+          python src/depth_validator.py --batch "runtime/${BATCH_ID}"
+
+      - name: Merge compact research history
+        env:
+          BATCH_ID: ${{ github.event.client_payload.batch_id }}
+        run: |
+          if test -f "runtime/${BATCH_ID}/features_1m.csv.gz"; then
+            python tools/merge_compact.py \
+              --batch "runtime/${BATCH_ID}" \
+              --dest-root "data/research/compact_1m" \
+              --dest-root-3m "data/research/compact_3m"
+          fi
+
+      - name: Commit compact research state
+        if: success()
+        shell: bash
+        run: |
+          git config user.name "advisorx-bot"
+          git config user.email "advisorx-bot@users.noreply.github.com"
+          git add data/research/compact_1m/ data/research/compact_3m/ data/state/protected_batches.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(data): update CoinDCX compact research state" || true
+            git pull --rebase origin main || true
+            git push origin HEAD:main || true
+          fi
+
+      - name: Run storage manager
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python src/storage_manager.py
+
+      - name: Upload processing outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coindcx-processed-${{ github.event.client_payload.batch_id }}
+          path: runtime/${{ github.event.client_payload.batch_id }}/
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Upload storage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coindcx-storage-report-${{ github.run_id }}
+          path: storage_report.json
+          retention-days: 14
+          if-no-files-found: ignore
