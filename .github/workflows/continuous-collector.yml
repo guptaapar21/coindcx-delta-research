@@ -8,7 +8,6 @@ on:
         required: false
         default: "30"
         type: string
-
       continue_chain:
         description: "Start/continue automatic batch chaining"
         required: false
@@ -23,14 +22,10 @@ permissions:
   contents: write
   actions: write
 
-concurrency:
-  group: advisorx-coindcx-collector
-  cancel-in-progress: false
-
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 235
+    timeout-minutes: 250
 
     steps:
       - name: Checkout
@@ -66,7 +61,6 @@ jobs:
       - name: Collect raw CoinDCX streams
         run: |
           mkdir -p "runtime/${{ steps.batch.outputs.batch_id }}"
-
           python src/collector.py \
             --duration-minutes "${{ steps.duration.outputs.minutes }}" \
             --out "runtime/${{ steps.batch.outputs.batch_id }}"
@@ -75,47 +69,7 @@ jobs:
         id: raw_complete
         if: success()
         shell: bash
-        run: |
-          echo "complete=true" >> "$GITHUB_OUTPUT"
-
-      - name: Build research features
-        if: success()
-        run: |
-          python src/research_batch.py \
-            --batch "runtime/${{ steps.batch.outputs.batch_id }}"
-
-          python tools/fix_futures_depth_symbols.py \
-            --batch "runtime/${{ steps.batch.outputs.batch_id }}"
-
-          python src/depth_validator.py \
-            --batch "runtime/${{ steps.batch.outputs.batch_id }}"
-
-      - name: Merge compact research history
-        if: success()
-        run: |
-          if test -f "runtime/${{ steps.batch.outputs.batch_id }}/features_1m.csv.gz"; then
-            python tools/merge_compact.py \
-              --batch "runtime/${{ steps.batch.outputs.batch_id }}" \
-              --dest-root "data/research/compact_1m" \
-              --dest-root-3m "data/research/compact_3m"
-          fi
-
-      - name: Commit compact research state
-        if: success()
-        shell: bash
-        run: |
-          git config user.name "advisorx-bot"
-          git config user.email "advisorx-bot@users.noreply.github.com"
-
-          git add \
-            data/research/compact_1m/ \
-            data/research/compact_3m/ \
-            data/state/protected_batches.json || true
-
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(data): update CoinDCX compact research state" || true
-            git push || true
-          fi
+        run: echo "complete=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload raw batch artifact
         if: always()
@@ -127,24 +81,10 @@ jobs:
           compression-level: 0
           if-no-files-found: warn
 
-      - name: Run storage manager
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python src/storage_manager.py
-
-      - name: Upload storage report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coindcx-storage-report-${{ github.run_id }}
-          path: storage_report.json
-          retention-days: 14
-          if-no-files-found: ignore
-
+      # IMPORTANT: trigger the next collector before any expensive downstream work.
+      # The processing job is intentionally decoupled into process-batch.yml.
       - name: Trigger next production batch
-        if: ${{ always() && steps.raw_complete.outputs.complete == 'true' && (github.event_name == 'repository_dispatch' || inputs.continue_chain == true) }}
+        if: ${{ steps.raw_complete.outputs.complete == 'true' && (github.event_name == 'repository_dispatch' || inputs.continue_chain == true) }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -156,4 +96,22 @@ jobs:
             -H "X-GitHub-Api-Version: 2026-03-10" \
             "/repos/${REPO}/dispatches" \
             -f event_type='coindcx-next-batch' \
-            -f client_payload[reason]='previous_batch_finished'
+            -f client_payload[reason]='raw_batch_finished'
+
+      - name: Trigger batch processing
+        if: ${{ steps.raw_complete.outputs.complete == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BATCH_ID: ${{ steps.batch.outputs.batch_id }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "/repos/${REPO}/dispatches" \
+            -f event_type='coindcx-process-batch' \
+            -f client_payload[batch_id]="${BATCH_ID}" \
+            -f client_payload[source_run_id]="${SOURCE_RUN_ID}"
