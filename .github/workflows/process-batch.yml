@@ -68,7 +68,7 @@ jobs:
           test -n "$ARTIFACT_ID"
           echo "Using raw artifact ID: $ARTIFACT_ID"
 
-          mkdir -p runtime
+          mkdir -p "runtime/${BATCH_ID}"
           downloaded=false
           for attempt in 1 2 3 4 5 6 7 8; do
             rm -f /tmp/raw.zip
@@ -82,8 +82,9 @@ jobs:
 
           test "$downloaded" = true
           test -s /tmp/raw.zip
-          unzip -q /tmp/raw.zip -d runtime
-          test -d "runtime/${BATCH_ID}"
+          unzip -q /tmp/raw.zip -d "runtime/${BATCH_ID}"
+          test -f "runtime/${BATCH_ID}/manifest.json"
+          test -f "runtime/${BATCH_ID}/data_quality.json"
 
       - name: Normalize Futures depth symbols
         env:
