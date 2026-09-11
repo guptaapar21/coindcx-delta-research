@@ -38,16 +38,50 @@ jobs:
           REPO: ${{ github.repository }}
           SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
           BATCH_ID: ${{ github.event.client_payload.batch_id }}
+          PAYLOAD_ARTIFACT_ID: ${{ github.event.client_payload.artifact_id }}
         shell: bash
         run: |
+          set -euo pipefail
           test -n "$SOURCE_RUN_ID"
           test -n "$BATCH_ID"
-          ARTIFACT_ID="$(gh api \
-            "/repos/${REPO}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name == ("coindcx-raw-" + env.BATCH_ID)) | .id' | head -n1)"
+
+          ARTIFACT_ID="$PAYLOAD_ARTIFACT_ID"
+
+          # New collector runs pass the exact artifact ID returned by
+          # actions/upload-artifact. This avoids an eventual-consistency race
+          # when searching the source run's artifact list immediately after upload.
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No artifact_id in dispatch payload; falling back to source-run lookup."
+            for attempt in 1 2 3 4 5 6 7 8; do
+              ARTIFACT_ID="$(gh api \
+                "/repos/${REPO}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" \
+                --jq '.artifacts[] | select(.name == ("coindcx-raw-" + env.BATCH_ID)) | .id' \
+                2>/dev/null | head -n1 || true)"
+              if [ -n "$ARTIFACT_ID" ]; then
+                break
+              fi
+              echo "Raw artifact not visible yet (lookup attempt ${attempt}/8); waiting 5s..."
+              sleep 5
+            done
+          fi
+
           test -n "$ARTIFACT_ID"
+          echo "Using raw artifact ID: $ARTIFACT_ID"
+
           mkdir -p runtime
-          gh api "/repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" > /tmp/raw.zip
+          downloaded=false
+          for attempt in 1 2 3 4 5 6 7 8; do
+            rm -f /tmp/raw.zip
+            if gh api "/repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" > /tmp/raw.zip; then
+              downloaded=true
+              break
+            fi
+            echo "Raw artifact download attempt ${attempt}/8 failed; waiting 5s..."
+            sleep 5
+          done
+
+          test "$downloaded" = true
+          test -s /tmp/raw.zip
           unzip -q /tmp/raw.zip -d runtime
           test -d "runtime/${BATCH_ID}"
 
@@ -104,13 +138,23 @@ jobs:
         if: success()
         shell: bash
         run: |
+          set -euo pipefail
           git config user.name "advisorx-bot"
           git config user.email "advisorx-bot@users.noreply.github.com"
           git add data/research/compact_1m/ data/research/compact_3m/ data/state/protected_batches.json || true
           if ! git diff --cached --quiet; then
-            git commit -m "chore(data): update CoinDCX compact research state" || true
-            git pull --rebase origin main || true
-            git push origin HEAD:main || true
+            git commit -m "chore(data): update CoinDCX compact research state"
+            pushed=false
+            for attempt in 1 2 3; do
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                pushed=true
+                break
+              fi
+              echo "Compact-state push attempt ${attempt}/3 failed; retrying..."
+              git rebase --abort 2>/dev/null || true
+              sleep 2
+            done
+            test "$pushed" = true
           fi
 
       - name: Run storage manager
