@@ -1,6 +1,14 @@
 name: AdvisorX CoinDCX continuous collector
 
 on:
+  # One controlled bootstrap trigger. It is removed immediately after the
+  # bootstrap run is launched; normal production chaining uses repository_dispatch.
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/CONTINUOUS_BOOTSTRAP'
+
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -57,7 +65,7 @@ jobs:
         id: duration
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "repository_dispatch" ] || [ "${{ github.event_name }}" = "push" ]; then
             echo "minutes=230" >> "$GITHUB_OUTPUT"
           else
             echo "minutes=${{ inputs.duration_minutes || '30' }}" >> "$GITHUB_OUTPUT"
@@ -141,7 +149,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Trigger next production batch
-        if: ${{ always() && steps.raw_complete.outputs.complete == 'true' && (github.event_name == 'repository_dispatch' || inputs.continue_chain == true) }}
+        if: ${{ always() && steps.raw_complete.outputs.complete == 'true' && (github.event_name == 'repository_dispatch' || github.event_name == 'push' || inputs.continue_chain == true) }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
