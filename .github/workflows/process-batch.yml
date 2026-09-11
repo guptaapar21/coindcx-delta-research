@@ -51,6 +51,11 @@ jobs:
           unzip -q /tmp/raw.zip -d runtime
           test -d "runtime/${BATCH_ID}"
 
+      - name: Normalize Futures depth symbols
+        env:
+          BATCH_ID: ${{ github.event.client_payload.batch_id }}
+        run: python tools/normalize_futures_depth_raw.py --batch "runtime/${BATCH_ID}"
+
       - name: Build research features
         env:
           BATCH_ID: ${{ github.event.client_payload.batch_id }}
@@ -76,8 +81,7 @@ jobs:
           missing = sorted(expected - symbols)
           populated = {}
           for s in sorted(expected):
-              sr = [r for r in rows if r.get("symbol") == s and r.get("futures_book_valid") == "True"]
-              populated[s] = len(sr)
+              populated[s] = sum(1 for r in rows if r.get("symbol") == s and r.get("futures_book_valid") == "True")
           print("canonical_symbols_ok", not bad)
           print("missing_canonical_symbols", missing)
           print("futures_book_valid_seconds", populated)
