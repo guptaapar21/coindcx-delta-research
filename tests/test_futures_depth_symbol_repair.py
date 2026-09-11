@@ -8,7 +8,8 @@ import fix_futures_depth_symbols
 
 
 def test_compact_future_symbol_is_merged_into_canonical_row(tmp_path):
-    path = tmp_path / "features_1s.csv.gz"
+    batch = tmp_path
+    path = batch / "features_1s.csv.gz"
     fields = [
         "symbol", "epoch_second", "futures_book_valid",
         "futures_best_bid", "futures_book_imbalance_1",
@@ -23,7 +24,7 @@ def test_compact_future_symbol_is_merged_into_canonical_row(tmp_path):
         writer.writeheader()
         writer.writerows(rows)
 
-    repaired, removed = fix_futures_depth_symbols.repair(path)
+    repaired, removed = fix_futures_depth_symbols.repair(batch)
     assert repaired == 1
     assert removed == 1
 
