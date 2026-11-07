@@ -14,6 +14,6 @@
     900,
     1800
   ],
-  "generated_utc": "2026-11-07T07:08:34.449550+00:00",
+  "generated_utc": "2026-11-07T10:59:38.487834+00:00",
   "note": "Compact history is retained as long-lived research data; raw websocket data lives in Actions artifacts/release archives. Longer forward-return labels are recalculated after merge so collector batch-boundary labels are not lost."
 }
